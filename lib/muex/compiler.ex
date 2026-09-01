@@ -138,18 +138,16 @@ defmodule Muex.Compiler do
   defp apply_mutation(ast, mutation) do
     original_ast = Map.get(mutation, :original_ast)
     mutated_ast = Map.get(mutation, :ast)
-    transform(ast, 0, original_ast, mutated_ast, match_line(mutation))
+    target_line = match_line(mutation)
+    target_ordinal = Map.get(mutation, :target_ordinal, 0)
+
+    {result, _seen, _replaced?} =
+      transform(ast, 0, original_ast, mutated_ast, target_line, target_ordinal, 0)
+
+    result
   end
 
-  # The line that identifies the node to replace, which is not necessarily the
-  # line the mutation reports. `location.line` is a display value: a mutator may
-  # point it at the source position a reader should look at rather than at the
-  # node being swapped — StatementDeletion reports the deleted statement's line
-  # while the node it replaces is the enclosing `__block__`. Using the reported
-  # line as the match key makes those mutations match nothing, so the "mutant"
-  # is the untouched original. `Muex.Mutator.walk/3` records the matched node's
-  # own line as `:original_line`; fall back to the reported line for mutations
-  # built by hand (tests, external callers) that carry no such annotation.
+  # The line identifying the node to replace can differ from the display line.
   defp match_line(mutation) do
     case Map.get(mutation, :original_line) do
       nil -> get_in(mutation, [:location, :line])
@@ -165,57 +163,134 @@ defmodule Muex.Compiler do
   # `Muex.Mutator.walk/3` assigns it during generation. Keyword keys and
   # module alias segments are left untouched, matching the generation-time
   # pruning so application targets exactly the nodes that were considered.
-  defp transform(node, enclosing_line, original, mutated, target_line) do
+  defp transform(node, enclosing_line, original, mutated, target_line, target_ordinal, seen) do
     line = node_line(node, enclosing_line)
 
     cond do
+      line == target_line and structurally_equal?(node, original) and seen == target_ordinal ->
+        {mutated, seen + 1, true}
+
       line == target_line and structurally_equal?(node, original) ->
-        mutated
+        {node, seen + 1, false}
 
       match?({:__aliases__, _meta, _segments}, node) ->
-        node
+        {node, seen, false}
 
       true ->
-        transform_children(node, line, original, mutated, target_line)
+        transform_children(node, line, original, mutated, target_line, target_ordinal, seen)
     end
   end
 
   # Call with an atom form: keep the form and recurse into args only.
-  defp transform_children({form, meta, args}, line, original, mutated, target_line)
+  defp transform_children(
+         {form, meta, args},
+         line,
+         original,
+         mutated,
+         target_line,
+         target_ordinal,
+         seen
+       )
        when is_atom(form) do
-    {form, meta, transform_args(args, line, original, mutated, target_line)}
+    {args, seen, replaced?} =
+      transform_args(args, line, original, mutated, target_line, target_ordinal, seen)
+
+    {{form, meta, args}, seen, replaced?}
   end
 
   # Call with a non-atom form (e.g. remote call): recurse into form and args.
-  defp transform_children({form, meta, args}, line, original, mutated, target_line) do
-    new_form = transform(form, line, original, mutated, target_line)
-    {new_form, meta, transform_args(args, line, original, mutated, target_line)}
+  defp transform_children(
+         {form, meta, args},
+         line,
+         original,
+         mutated,
+         target_line,
+         target_ordinal,
+         seen
+       ) do
+    {form, seen, replaced?} =
+      transform(form, line, original, mutated, target_line, target_ordinal, seen)
+
+    if replaced? do
+      {{form, meta, args}, seen, true}
+    else
+      {args, seen, replaced?} =
+        transform_args(args, line, original, mutated, target_line, target_ordinal, seen)
+
+      {{form, meta, args}, seen, replaced?}
+    end
   end
 
   # Two-element tuple: never rewrite an atom key, always recurse the value.
-  defp transform_children({left, right}, line, original, mutated, target_line) do
-    new_left =
-      if is_atom(left), do: left, else: transform(left, line, original, mutated, target_line)
+  defp transform_children(
+         {left, right},
+         line,
+         original,
+         mutated,
+         target_line,
+         target_ordinal,
+         seen
+       ) do
+    {left, seen, replaced?} =
+      if is_atom(left),
+        do: {left, seen, false},
+        else: transform(left, line, original, mutated, target_line, target_ordinal, seen)
 
-    {new_left, transform(right, line, original, mutated, target_line)}
+    if replaced? do
+      {{left, right}, seen, true}
+    else
+      {right, seen, replaced?} =
+        transform(right, line, original, mutated, target_line, target_ordinal, seen)
+
+      {{left, right}, seen, replaced?}
+    end
   end
 
-  defp transform_children(list, line, original, mutated, target_line) when is_list(list) do
-    Enum.map(list, &transform(&1, line, original, mutated, target_line))
+  defp transform_children(list, line, original, mutated, target_line, target_ordinal, seen)
+       when is_list(list) do
+    transform_list(list, line, original, mutated, target_line, target_ordinal, seen, [])
   end
 
-  defp transform_children(leaf, _line, _original, _mutated, _target_line), do: leaf
+  defp transform_children(leaf, _line, _original, _mutated, _target_line, _target_ordinal, seen),
+    do: {leaf, seen, false}
 
-  defp transform_args(args, _line, _original, _mutated, _target_line) when is_atom(args) do
-    args
+  defp transform_args(args, _line, _original, _mutated, _target_line, _target_ordinal, seen)
+       when is_atom(args) do
+    {args, seen, false}
   end
 
-  defp transform_args(args, line, original, mutated, target_line) when is_list(args) do
-    Enum.map(args, &transform(&1, line, original, mutated, target_line))
+  defp transform_args(args, line, original, mutated, target_line, target_ordinal, seen)
+       when is_list(args) do
+    transform_list(args, line, original, mutated, target_line, target_ordinal, seen, [])
   end
 
-  defp transform_args(args, line, original, mutated, target_line) do
-    transform(args, line, original, mutated, target_line)
+  defp transform_args(args, line, original, mutated, target_line, target_ordinal, seen) do
+    transform(args, line, original, mutated, target_line, target_ordinal, seen)
+  end
+
+  defp transform_list([], _line, _original, _mutated, _target_line, _target_ordinal, seen, acc),
+    do: {Enum.reverse(acc), seen, false}
+
+  defp transform_list(
+         [head | tail],
+         line,
+         original,
+         mutated,
+         target_line,
+         target_ordinal,
+         seen,
+         acc
+       ) do
+    {head, seen, replaced?} =
+      transform(head, line, original, mutated, target_line, target_ordinal, seen)
+
+    if replaced? do
+      {Enum.reverse(acc, [head | tail]), seen, true}
+    else
+      transform_list(tail, line, original, mutated, target_line, target_ordinal, seen, [
+        head | acc
+      ])
+    end
   end
 
   defp node_line({_form, meta, _args}, enclosing_line) when is_list(meta) do

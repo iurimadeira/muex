@@ -31,7 +31,12 @@ defmodule Muex.Reporter.Json do
     report = build_report(results)
     json = Jason.encode!(report, pretty: true)
 
-    File.write(output_file, json)
+    temporary = output_file <> ".tmp"
+
+    with :ok <- File.mkdir_p(Path.dirname(output_file)),
+         :ok <- File.write(temporary, json <> "\n", [:binary, :sync]) do
+      File.rename(temporary, output_file)
+    end
   end
 
   @doc """
@@ -57,6 +62,9 @@ defmodule Muex.Reporter.Json do
     survived = Enum.count(results, &(&1.result == :survived))
     invalid = Enum.count(results, &(&1.result == :invalid))
     timeout = Enum.count(results, &(&1.result == :timeout))
+    equivalent = Enum.count(results, &(&1.result == :equivalent))
+    no_coverage = Enum.count(results, &(&1.result == :no_coverage))
+    no_op = Enum.count(results, &(&1.result == :no_op))
 
     denom = killed + survived + timeout
 
@@ -74,6 +82,9 @@ defmodule Muex.Reporter.Json do
         survived: survived,
         invalid: invalid,
         timeout: timeout,
+        equivalent: equivalent,
+        no_coverage: no_coverage,
+        no_op: no_op,
         mutation_score_low: score_low,
         mutation_score_high: score_high
       },
@@ -85,6 +96,7 @@ defmodule Muex.Reporter.Json do
     mutation = result.mutation
 
     %{
+      id: Map.get(mutation, :id),
       status: result.result,
       mutator: inspect(mutation.mutator),
       description: mutation.description,
@@ -94,7 +106,8 @@ defmodule Muex.Reporter.Json do
       },
       patch: Patch.of(mutation),
       duration_ms: Map.get(result, :duration_ms, 0),
-      error: format_error(Map.get(result, :error))
+      error: format_error(Map.get(result, :error)),
+      timings: Map.get(result, :timings, %{})
     }
   end
 

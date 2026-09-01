@@ -41,7 +41,7 @@ defmodule Muex.CLI do
         System.halt(1)
 
       {:ok, config} ->
-        unless File.exists?("mix.exs") do
+        if !File.exists?("mix.exs") do
           IO.puts(:stderr, "Error: No mix.exs found in current directory")
           IO.puts(:stderr, "Please run muex from the root of an Elixir project")
           System.halt(1)
@@ -113,7 +113,6 @@ defmodule Muex.CLI do
         --optimize-level <level>    Optimization: conservative, balanced, aggressive
         --min-complexity <n>        Minimum complexity for mutations (default: 2)
         --max-per-function <n>      Max mutations per function (default: 20)
-        --tce / --no-tce            Trivial Compiler Equivalence (default: enabled)
         --since <ref>               Only mutate lines changed since a git ref
         --coverage-guided           Run only tests covering each mutated line
         -h, --help                  Show this help message
@@ -157,7 +156,7 @@ defmodule Muex.CLI do
   end
 
   defp print_version do
-    version = Application.spec(:muex, :vsn) |> to_string()
+    version = :muex |> Application.spec(:vsn) |> to_string()
     IO.puts("Muex version #{version}")
   end
 end

@@ -9,6 +9,8 @@ defmodule Muex.ConfigTest do
       assert config.files == ["lib"]
       assert config.test_paths == ["test"]
       assert config.app == nil
+      assert config.project_root == File.cwd!()
+      assert config.skip_calls == []
       assert config.language == Muex.Language.Elixir
       assert config.filter == true
       assert config.verbose == false
@@ -21,7 +23,7 @@ defmodule Muex.ConfigTest do
       assert config.min_score == 20
       assert config.min_complexity == nil
       assert config.max_per_function == nil
-      assert config.tce == true
+      assert config.tce == false
       assert config.since == nil
       assert config.coverage_guided == false
       assert Muex.Mutator.Literal in config.mutators
@@ -139,9 +141,9 @@ defmodule Muex.ConfigTest do
       assert config.tce == false
     end
 
-    test "parses --tce explicitly" do
-      assert {:ok, config} = Config.from_args(["--tce"])
-      assert config.tce == true
+    test "rejects --tce because compiler equivalence is unsound" do
+      assert {:error, message} = Config.from_args(["--tce"])
+      assert message =~ "compiler-equivalence detection is not sound"
     end
 
     test "parses --since" do

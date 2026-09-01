@@ -1,4 +1,5 @@
 defmodule Mix.Tasks.Muex do
+  @shortdoc "Run mutation testing"
   @moduledoc """
   Run mutation testing on your project.
 
@@ -27,10 +28,15 @@ defmodule Mix.Tasks.Muex do
     * `--optimize-level` - Optimization preset: conservative, balanced, aggressive (default: balanced)
     * `--min-complexity` - Minimum complexity for mutations (default: 2, with --optimize)
     * `--max-per-function` - Max mutations per function (default: 20, with --optimize)
-    * `--tce` / `--no-tce` - Enable/disable Trivial Compiler Equivalence (default: enabled)
+    * `--tce` - Rejected: compiler-equivalence detection is disabled as unsound
     * `--since` - Only test mutations on lines changed since a git ref, e.g. --since main (PR scoping)
     * `--coverage-guided` - Run only the tests that cover each mutated line (default: disabled)
     * `--keep-metadata-mutations` - Keep mutations with no source location (line: 0); dropped by default
+    * `--checkpoint` - Append terminal mutation results to a resumable JSONL checkpoint
+    * `--report-file` - Write the structured report atomically to this exact path
+    * `--audit-dir` - Write full plans, attempt events, and untruncated process output artifacts
+    * `--baseline-timeout` - Separate timeout in milliseconds for each sandbox baseline
+    * `--mutant-id` - Deterministically select one mutation ID from the generated plan
     * `--preset` - Framework preset to prune DSL noise: phoenix, ecto, ash, none (default: none)
 
   ## Examples
@@ -50,13 +56,11 @@ defmodule Mix.Tasks.Muex do
       mix muex --preset phoenix           # Prune Phoenix component/router DSL noise
       mix muex --since main               # Only mutate lines changed since main
       mix muex --coverage-guided          # Run only tests covering each mutated line
-      mix muex --no-tce                   # Disable Trivial Compiler Equivalence
       mix muex --files "lib/my_module.ex" --test-paths "test/my_module_test.exs"
   """
 
   use Mix.Task
 
-  @shortdoc "Run mutation testing"
   @impl Mix.Task
   def run(args) do
     case Muex.Config.from_args(args) do

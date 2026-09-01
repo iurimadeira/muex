@@ -12,13 +12,17 @@ defmodule Muex.Loader do
   """
   @spec load_all([String.t()], module(), keyword()) :: {:ok, [file_entry()]} | {:error, term()}
   def load_all(path_patterns, language_adapter, opts \\ []) do
-    files =
-      Enum.flat_map(path_patterns, fn pattern ->
-        {:ok, entries} = load(pattern, language_adapter, opts)
-        entries
-      end)
-
-    {:ok, Enum.uniq_by(files, & &1.path)}
+    path_patterns
+    |> Enum.reduce_while({:ok, []}, fn pattern, {:ok, files} ->
+      case load(pattern, language_adapter, opts) do
+        {:ok, entries} -> {:cont, {:ok, entries ++ files}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, files} -> {:ok, files |> Enum.reverse() |> Enum.uniq_by(& &1.path)}
+      {:error, _} = error -> error
+    end
   end
 
   @doc """
@@ -36,27 +40,28 @@ defmodule Muex.Loader do
 
     `{:ok, files}` where files is a list of `file_entry` maps
   """
-  @spec load(String.t(), module(), keyword()) :: {:ok, [file_entry()]}
+  @spec load(String.t(), module(), keyword()) :: {:ok, [file_entry()]} | {:error, term()}
   def load(path_pattern, language_adapter, opts \\ []) do
     extensions = language_adapter.file_extensions()
     test_pattern = language_adapter.test_file_pattern()
     exclude_patterns = Keyword.get(opts, :exclude, [test_pattern])
 
-    files =
+    results =
       path_pattern
       |> discover_files(extensions)
       |> Enum.reject(&excluded?(&1, exclude_patterns))
       |> Enum.map(&parse_file(&1, language_adapter))
-      |> Enum.filter(&match?({:ok, _}, &1))
-      |> Enum.map(fn {:ok, entry} -> entry end)
 
-    {:ok, files}
+    case Enum.find(results, &match?({:error, _, _}, &1)) do
+      {:error, path, reason} -> {:error, {:source_load_failed, path, reason}}
+      nil -> {:ok, Enum.map(results, fn {:ok, entry} -> entry end)}
+    end
   end
 
   defp discover_files(path_pattern, extensions) do
     cond do
       String.contains?(path_pattern, ["*", "?"]) ->
-        Path.wildcard(path_pattern) |> Enum.filter(&has_extension?(&1, extensions))
+        path_pattern |> Path.wildcard() |> Enum.filter(&has_extension?(&1, extensions))
 
       File.regular?(path_pattern) ->
         if has_extension?(path_pattern, extensions) do
@@ -71,7 +76,7 @@ defmodule Muex.Loader do
         |> Enum.uniq()
 
       true ->
-        Path.wildcard(path_pattern) |> Enum.filter(&has_extension?(&1, extensions))
+        path_pattern |> Path.wildcard() |> Enum.filter(&has_extension?(&1, extensions))
     end
   end
 
@@ -95,6 +100,8 @@ defmodule Muex.Loader do
       # mutation without re-reading from disk (which may see a concurrent
       # worker's mutation instead of the original).
       {:ok, %{path: path, ast: ast, module_name: module_name, original_source: source}}
+    else
+      {:error, reason} -> {:error, path, reason}
     end
   end
 

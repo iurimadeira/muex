@@ -138,9 +138,8 @@ defmodule Muex.SandboxTest do
 
   describe "apply_mutation/4 and restore/2" do
     setup do
-      root = Path.join(System.tmp_dir!(), "muex_test_sandbox_#{System.system_time(:microsecond)}")
-      sandbox = Sandbox.create_sandbox(root, @project_root, "test", ["test"])
-      on_exit(fn -> File.rm_rf!(root) end)
+      [sandbox] = Sandbox.create_pool(1, project_root: @project_root, test_paths: ["test"])
+      on_exit(fn -> Sandbox.cleanup([sandbox]) end)
       %{sandbox: sandbox}
     end
 

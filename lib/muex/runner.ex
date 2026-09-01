@@ -29,16 +29,40 @@ defmodule Muex.Runner do
       - `:max_workers` - Maximum concurrent workers (default: 4)
       - `:timeout_ms` - Test timeout in milliseconds (default: 5000)
       - `:test_paths` - List of test path patterns (default: ["test"])
+      - `:baseline_mutations` - Immutable full shard selection used to derive the baseline test union
       - `:verbose` - Show progress (default: false)
 
   ## Returns
 
     List of `mutation_result` maps
   """
-  @spec run_all([map()], %{Path.t() => map()}, module(), map(), map(), keyword()) :: [
-          mutation_result()
-        ]
+  @spec run_all([map()], %{Path.t() => map()}, module(), map(), map(), keyword()) ::
+          [mutation_result()]
   def run_all(
+        mutations,
+        file_entries,
+        language_adapter,
+        dependency_map,
+        file_to_module,
+        opts \\ []
+      ) do
+    case run_all_result(
+           mutations,
+           file_entries,
+           language_adapter,
+           dependency_map,
+           file_to_module,
+           opts
+         ) do
+      {:ok, results} -> results
+      {:error, reason} -> raise "mutation run failed: #{inspect(reason)}"
+    end
+  end
+
+  @doc false
+  @spec run_all_result([map()], %{Path.t() => map()}, module(), map(), map(), keyword()) ::
+          {:ok, [mutation_result()]} | {:error, term()}
+  def run_all_result(
         mutations,
         file_entries,
         language_adapter,
@@ -50,7 +74,7 @@ defmodule Muex.Runner do
     {:ok, pool} = Muex.WorkerPool.start_link(max_workers: max_workers)
 
     try do
-      Muex.WorkerPool.run_mutations(
+      Muex.WorkerPool.run_mutations_result(
         pool,
         mutations,
         file_entries,

@@ -16,6 +16,15 @@ defmodule Muex.Reporter do
   @magenta "\e[35m"
   @cyan "\e[36m"
   @gray "\e[90m"
+  @progress %{
+    killed: {"·", @green},
+    survived: {"×", @red},
+    invalid: {"-", @yellow},
+    timeout: {"?", @magenta},
+    equivalent: {"≡", @gray},
+    no_coverage: {"∅", @gray},
+    no_op: {"=", @gray}
+  }
 
   @doc """
   Prints a summary of mutation testing results.
@@ -107,15 +116,7 @@ defmodule Muex.Reporter do
   """
   @spec print_progress(map(), non_neg_integer(), non_neg_integer()) :: :ok
   def print_progress(result, index, total) do
-    {symbol, color} =
-      case result.result do
-        :killed -> {"·", @green}
-        :survived -> {"×", @red}
-        :invalid -> {"-", @yellow}
-        :timeout -> {"?", @magenta}
-        :equivalent -> {"≡", @gray}
-        :no_coverage -> {"∅", @gray}
-      end
+    {symbol, color} = Map.fetch!(@progress, result.result)
 
     IO.write("#{color}#{symbol}#{@reset}")
 

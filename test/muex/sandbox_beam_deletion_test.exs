@@ -32,6 +32,12 @@ defmodule Muex.SandboxBeamDeletionTest do
     %{base: base, project: project, sandbox_root: sandbox_root}
   end
 
+  defp create_owned_sandbox(project, env) do
+    [sandbox] = Sandbox.create_pool(1, project_root: project, build_env: env, test_paths: [])
+    on_exit(fn -> Sandbox.cleanup([sandbox]) end)
+    sandbox
+  end
+
   defp build_app(project, env, beams) do
     ebin = Path.join([project, "_build", env, "lib", @app, "ebin"])
     File.mkdir_p!(ebin)
@@ -53,11 +59,12 @@ defmodule Muex.SandboxBeamDeletionTest do
     do: Path.join([project, "_build", env, "lib", @app, "ebin", name])
 
   test "leaves the project's beams alone when the app build is still a symlink",
-       %{project: project, sandbox_root: root} do
+       %{project: project} do
     beam = "#{@module}.beam"
     build_app(project, "test", [beam])
 
-    sandbox = Sandbox.create_sandbox(root, project, "test", [])
+    sandbox = create_owned_sandbox(project, "test")
+    root = sandbox.root
 
     # Force the situation the bug needs: the sandbox's app build is a symlink
     # into the project, exactly as create_sandbox leaves it before any copy.
@@ -77,11 +84,12 @@ defmodule Muex.SandboxBeamDeletionTest do
   end
 
   test "removes the beam from its own copy, not from the project",
-       %{project: project, sandbox_root: root} do
+       %{project: project} do
     beam = "#{@module}.beam"
     build_app(project, "test", [beam])
 
-    sandbox = Sandbox.create_sandbox(root, project, "test", [])
+    sandbox = create_owned_sandbox(project, "test")
+    root = sandbox.root
 
     assert {:ok, _} =
              Sandbox.apply_mutation(
@@ -97,11 +105,12 @@ defmodule Muex.SandboxBeamDeletionTest do
     assert File.exists?(project_beam(project, "test", beam))
   end
 
-  test "handles sources compiled from outside lib/", %{project: project, sandbox_root: root} do
+  test "handles sources compiled from outside lib/", %{project: project} do
     beam = "#{Elixir.Demo.Helper}.beam"
     build_app(project, "test", [beam])
 
-    sandbox = Sandbox.create_sandbox(root, project, "test", [])
+    sandbox = create_owned_sandbox(project, "test")
+    root = sandbox.root
     File.mkdir_p!(Path.join(root, "tools"))
     File.write!(Path.join([root, "tools", "helper.ex"]), "defmodule Demo.Helper do\nend\n")
 
@@ -118,11 +127,12 @@ defmodule Muex.SandboxBeamDeletionTest do
   end
 
   test "uses the sandbox's build env rather than assuming test",
-       %{project: project, sandbox_root: root} do
+       %{project: project} do
     beam = "#{@module}.beam"
     build_app(project, "dev", [beam])
 
-    sandbox = Sandbox.create_sandbox(root, project, "dev", [])
+    sandbox = create_owned_sandbox(project, "dev")
+    root = sandbox.root
 
     assert {:ok, _} =
              Sandbox.apply_mutation(
@@ -137,7 +147,7 @@ defmodule Muex.SandboxBeamDeletionTest do
   end
 
   test "takes the build copy from MIX_BUILD_ROOT when it is set",
-       %{base: base, project: project, sandbox_root: root} do
+       %{base: base, project: project} do
     beam = "#{@module}.beam"
 
     # The project also has a stale <project>/_build from an earlier run; the
@@ -158,7 +168,8 @@ defmodule Muex.SandboxBeamDeletionTest do
     System.put_env("MIX_BUILD_ROOT", build_root)
     on_exit(fn -> System.delete_env("MIX_BUILD_ROOT") end)
 
-    sandbox = Sandbox.create_sandbox(root, project, "test", [])
+    sandbox = create_owned_sandbox(project, "test")
+    root = sandbox.root
 
     assert {:ok, _} =
              Sandbox.apply_mutation(
@@ -186,7 +197,7 @@ defmodule Muex.SandboxBeamDeletionTest do
   # directories cannot name the app under test in that situation; the app name
   # has to come from the project itself.
   test "resolves the app name when dependencies are built alongside it",
-       %{project: project, sandbox_root: root} do
+       %{project: project} do
     beam = "#{@module}.beam"
     build_app(project, "test", [beam])
     build_dep(project, "test", "jason")
@@ -194,14 +205,14 @@ defmodule Muex.SandboxBeamDeletionTest do
 
     write_mix_exs(project, "[app: @app, version: \"0.1.0\", elixir: \"~> 1.14\"]")
 
-    assert_own_build_copy(project, root, beam)
+    assert_own_build_copy(project, beam)
   end
 
   # `:app` is not unique to the project's own options: `escript:` takes one too.
   # Reading the first `app:` found anywhere in `def project` would answer with
   # that one whenever it comes first.
   test "reads the project's own app name, not a nested one",
-       %{project: project, sandbox_root: root} do
+       %{project: project} do
     beam = "#{@module}.beam"
     build_app(project, "test", [beam])
     build_dep(project, "test", "jason")
@@ -215,7 +226,7 @@ defmodule Muex.SandboxBeamDeletionTest do
           ]\
     """)
 
-    assert_own_build_copy(project, root, beam)
+    assert_own_build_copy(project, beam)
   end
 
   defp write_mix_exs(project, options) do
@@ -232,8 +243,9 @@ defmodule Muex.SandboxBeamDeletionTest do
     """)
   end
 
-  defp assert_own_build_copy(project, root, beam) do
-    sandbox = Sandbox.create_sandbox(root, project, "test", [])
+  defp assert_own_build_copy(project, beam) do
+    sandbox = create_owned_sandbox(project, "test")
+    root = sandbox.root
 
     assert {:ok, _} =
              Sandbox.apply_mutation(

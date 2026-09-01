@@ -10,12 +10,6 @@ defmodule Muex.TestRunner.PortTest do
       assert match?({:ok, %{exit_code: exit_code}} when exit_code != 0, result) or
                match?({:error, _}, result)
     end
-
-    test "handles empty test file list" do
-      result = PortRunner.run_tests([], timeout_ms: 10_000)
-
-      assert match?({:ok, _}, result) or match?({:error, _}, result)
-    end
   end
 
   describe "compile error classification" do
