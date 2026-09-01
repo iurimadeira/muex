@@ -6,12 +6,14 @@ defmodule Muex.HardeningTest do
   alias Muex.Audit
   alias Muex.Checkpoint
   alias Muex.Compiler
+  alias Muex.Config
   alias Muex.Continuation
   alias Muex.Continuation.Artifact
   alias Muex.Coverage
   alias Muex.ExUnitFormatter
   alias Muex.InventoryCache
   alias Muex.Language.Elixir, as: ElixirLanguage
+  alias Muex.MutantOptimizer
   alias Muex.Mutator.Comparison
   alias Muex.Mutator.Literal
   alias Muex.Runner
@@ -637,6 +639,59 @@ defmodule Muex.HardeningTest do
 
     assert {:ok, [^mutation], %{status: "hit", selected_count: 1}} =
              InventoryCache.load(cache, key, "input", audit)
+  end
+
+  @tag :tmp_dir
+  test "inventory cache round-trips optimizer-scored mutations", %{tmp_dir: tmp_dir} do
+    cache = Path.join(tmp_dir, "cache/shard-1.etf")
+    plan = Path.join(tmp_dir, "audit/plan.json")
+    audit = Path.join(tmp_dir, "second-audit")
+    key = String.duplicate("c", 64)
+
+    [mutation] =
+      [Map.put(mutation(), :id, String.duplicate("d", 64))]
+      |> MutantOptimizer.score_by_impact()
+
+    assert Map.has_key?(mutation, :impact_score)
+
+    File.mkdir_p!(Path.dirname(plan))
+    File.write!(plan, ~s({"selected_count":1}))
+
+    assert {:ok, %{status: "miss"}} =
+             InventoryCache.publish(cache, key, "input", [mutation], plan)
+
+    assert {:ok, [^mutation], %{status: "hit"}} =
+             InventoryCache.load(cache, key, "input", audit)
+  end
+
+  @tag :tmp_dir
+  test "inventory cache ships the atom names its payload needs", %{tmp_dir: tmp_dir} do
+    cache = Path.join(tmp_dir, "cache/shard-1.etf")
+    plan = Path.join(tmp_dir, "audit/plan.json")
+    key = String.duplicate("c", 64)
+
+    mutation =
+      mutation()
+      |> Map.put(:id, String.duplicate("d", 64))
+      |> Map.put(:ast, {:__block__, [], [[key: :cached_atom_in_list], %{cached_atom_key: 1}]})
+
+    File.mkdir_p!(Path.dirname(plan))
+    File.write!(plan, ~s({"selected_count":1}))
+
+    assert {:ok, _metadata} = InventoryCache.publish(cache, key, "input", [mutation], plan)
+
+    assert {names, payload} = :erlang.binary_to_term(File.read!(cache), [:safe])
+    assert is_binary(payload)
+    assert Enum.all?(names, &is_binary/1)
+
+    for name <- ~w(__block__ key cached_atom_in_list cached_atom_key location file),
+        do: assert(name in names)
+  end
+
+  test "audit rendering resolves a language adapter per source extension" do
+    assert {:ok, Muex.Language.Elixir} = Config.language_for_path("lib/a.ex")
+    assert {:ok, Muex.Language.Erlang} = Config.language_for_path("src/a.erl")
+    assert {:error, _reason} = Config.language_for_path("README.md")
   end
 
   @tag :tmp_dir
@@ -2508,6 +2563,27 @@ defmodule Muex.HardeningTest do
     assert [header] = checkpoint |> File.stream!() |> Enum.map(&Jason.decode!/1)
     assert header["total"] == 0
     assert header["campaign_fingerprint"] == "campaign"
+    assert report |> File.read!() |> Jason.decode!() |> get_in(["summary", "total"]) == 0
+  end
+
+  @tag :tmp_dir
+  test "an explicit report file is written for every output format", %{tmp_dir: tmp_dir} do
+    source = Path.join(tmp_dir, "lib/example.ex")
+    report = Path.join(tmp_dir, "report.json")
+    File.mkdir_p!(Path.dirname(source))
+    File.write!(source, "defmodule TerminalReport do\nend\n")
+
+    assert {:ok, config} =
+             Muex.Config.from_opts(
+               files: source,
+               project_root: tmp_dir,
+               test_paths: "test",
+               no_filter: true,
+               report_file: report
+             )
+
+    assert config.format == "terminal"
+    assert {:ok, %{results: []}} = ExUnit.CaptureIO.with_io(fn -> Muex.run(config) end) |> elem(0)
     assert report |> File.read!() |> Jason.decode!() |> get_in(["summary", "total"]) == 0
   end
 

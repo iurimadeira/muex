@@ -861,6 +861,12 @@ defmodule Muex do
     JsonReporter.generate(results, output_file: path)
   end
 
+  defp output_report(results, %Muex.Config{report_file: path} = config) when is_binary(path) do
+    with :ok <- JsonReporter.generate(results, output_file: path) do
+      output_report(results, %{config | report_file: nil})
+    end
+  end
+
   defp output_report(results, %Muex.Config{format: "html", verbose: verbose}) do
     HtmlReporter.generate(results)
     log("HTML report generated: muex-report.html", verbose)

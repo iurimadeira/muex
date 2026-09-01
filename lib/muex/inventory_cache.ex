@@ -29,7 +29,8 @@ defmodule Muex.InventoryCache do
   def publish(path, cache_key, input_fingerprint, mutations, plan_path) do
     envelope = envelope(path, cache_key, input_fingerprint, mutations, plan_path)
 
-    with :ok <- File.mkdir_p(Path.dirname(path)),
+    with :ok <- validate_envelope(envelope, cache_key, input_fingerprint),
+         :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- publish_plan(plan_path, cached_plan_path(path), envelope),
          :ok <- publish_envelope(path, envelope) do
       {:ok, metadata(path, envelope, "miss")}
@@ -331,11 +332,7 @@ defmodule Muex.InventoryCache do
   defp publish_envelope(path, envelope) do
     temporary = path <> ".#{System.unique_integer([:positive])}.tmp"
 
-    case File.write(temporary, :erlang.term_to_binary(envelope, compressed: 6), [
-           :binary,
-           :exclusive,
-           :sync
-         ]) do
+    case File.write(temporary, encode(envelope), [:binary, :exclusive, :sync]) do
       :ok ->
         result =
           case File.ln(temporary, path) do
@@ -376,7 +373,60 @@ defmodule Muex.InventoryCache do
     end
   end
 
+  # A `:safe` decode cannot create atoms, and a reader such as
+  # `mix muex.continuation prepare` never runs a mutator, so the cache ships the
+  # name of every atom it contains — Muex's own map keys and whatever the
+  # mutators synthesized into the cached AST alike — as a list of binaries the
+  # reader interns before decoding the envelope itself. The outer term holds no
+  # atom, so it always decodes under `:safe`.
+  @max_cached_atoms 100_000
+
+  defp encode(envelope) do
+    names = envelope |> collect_atoms(%{}) |> Map.keys() |> Enum.map(&Atom.to_string/1)
+    :erlang.term_to_binary({names, :erlang.term_to_binary(envelope)}, compressed: 6)
+  end
+
+  defp collect_atoms(atom, acc) when is_atom(atom), do: Map.put(acc, atom, true)
+  defp collect_atoms([], acc), do: acc
+  defp collect_atoms([head | tail], acc), do: collect_atoms(tail, collect_atoms(head, acc))
+
+  defp collect_atoms(tuple, acc) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> collect_atoms(acc)
+
+  defp collect_atoms(map, acc) when is_map(map), do: map |> Map.to_list() |> collect_atoms(acc)
+
+  # Numbers, binaries, and bitstrings are the remaining leaves and carry no atom;
+  # pids, refs, ports, and funs cannot survive a `:safe` decode anyway.
+  defp collect_atoms(_leaf, acc), do: acc
+
   defp decode(binary) do
+    case safe_decode(binary) do
+      {:ok, {names, payload}} when is_binary(payload) ->
+        with :ok <- intern_atoms(names), do: safe_decode(payload)
+
+      {:ok, _other} ->
+        {:error, "invalid mutation inventory cache ETF"}
+
+      error ->
+        error
+    end
+  end
+
+  defp intern_atoms(names) when is_list(names) do
+    if length(names) <= @max_cached_atoms and Enum.all?(names, &is_binary/1) do
+      Enum.each(names, &String.to_atom/1)
+      :ok
+    else
+      {:error, "invalid mutation inventory cache atom table"}
+    end
+  rescue
+    _error in [ArgumentError, SystemLimitError] ->
+      {:error, "invalid mutation inventory cache atom table"}
+  end
+
+  defp intern_atoms(_names), do: {:error, "invalid mutation inventory cache atom table"}
+
+  defp safe_decode(binary) do
     {:ok, :erlang.binary_to_term(binary, [:safe])}
   rescue
     _error in ArgumentError -> {:error, "invalid mutation inventory cache ETF"}

@@ -221,12 +221,13 @@ defmodule Muex.Audit do
     kind, reason -> normalize_generation_result({:error, {kind, reason}})
   end
 
-  defp preserve_line_endings({:ok, source}, reference),
+  @doc false
+  def preserve_line_endings({:ok, source}, reference),
     do: {:ok, preserve_line_endings(source, reference)}
 
-  defp preserve_line_endings({:error, _reason} = error, _reference), do: error
+  def preserve_line_endings({:error, _reason} = error, _reference), do: error
 
-  defp preserve_line_endings(source, reference) do
+  def preserve_line_endings(source, reference) do
     ending =
       case Regex.run(~r/(?:\r?\n)+\z/, reference) do
         [line_endings] -> line_endings

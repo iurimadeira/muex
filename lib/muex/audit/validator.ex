@@ -1,6 +1,8 @@
 defmodule Muex.Audit.Validator do
   @moduledoc false
 
+  alias Muex.Audit
+
   @version 1
   @statuses ~w(killed survived invalid timeout equivalent no_coverage no_op)
   @valid_mutant_keys ~w(
@@ -230,11 +232,13 @@ defmodule Muex.Audit.Validator do
   end
 
   defp validate_mutant_entries(mutants, ids, candidate_count) do
+    renderings = original_renderings(mutants)
+
     cond do
       Enum.any?(mutants, &(Map.get(&1, "selected") not in [true, false])) ->
         {:error, :plan_invalid_selection}
 
-      Enum.any?(mutants, &(not valid_mutant_entry?(&1))) ->
+      Enum.any?(mutants, &(not valid_mutant_entry?(&1, renderings))) ->
         {:error, :plan_invalid_mutant_entry}
 
       Enum.any?(ids, &(not is_binary(&1) or &1 == "")) ->
@@ -251,28 +255,28 @@ defmodule Muex.Audit.Validator do
     end
   end
 
-  defp valid_mutant_entry?(entry) do
+  defp valid_mutant_entry?(entry, renderings) do
     keys = entry |> Map.keys() |> Enum.sort()
 
     case keys do
       @valid_mutant_keys ->
-        valid_standard_mutant?(entry)
+        valid_standard_mutant?(entry, renderings)
 
       @generation_error_mutant_keys ->
         valid_generation_error_mutant?(entry)
 
       @identical_source_mutant_keys ->
-        valid_identical_source_mutant?(entry)
+        valid_identical_source_mutant?(entry, renderings)
 
       _other ->
         false
     end
   end
 
-  defp valid_standard_mutant?(entry) do
+  defp valid_standard_mutant?(entry, renderings) do
     valid_common_mutant_fields?(entry) and
       valid_source_hash?(entry["mutated_source"], entry["mutated_sha256"]) and
-      patch_matches_sources?(entry)
+      patch_matches_sources?(entry, renderings)
   end
 
   defp valid_generation_error_mutant?(entry) do
@@ -281,11 +285,11 @@ defmodule Muex.Audit.Validator do
       valid_generation_error?(entry["generation_error"])
   end
 
-  defp valid_identical_source_mutant?(entry) do
+  defp valid_identical_source_mutant?(entry, renderings) do
     valid_common_mutant_fields?(entry) and entry["selected"] == false and
       entry["selection_reason"] == "excluded_identical_source" and
       valid_source_hash?(entry["mutated_source"], entry["mutated_sha256"]) and
-      patch_matches_sources?(entry) and
+      patch_matches_sources?(entry, renderings) and
       valid_generation_exclusion?(entry["generation_exclusion"], entry["mutated_sha256"])
   end
 
@@ -322,22 +326,56 @@ defmodule Muex.Audit.Validator do
     ) == entry["id"]
   end
 
-  defp patch_matches_sources?(entry) do
+  # `original_source` holds the verbatim bytes on disk while `patch` snippets and
+  # `mutated_source` are renderings of the mutated AST, so a source that is not
+  # already written in its rendered form only reconstructs against that rendering.
+  defp original_renderings(mutants) do
+    mutants
+    |> Enum.map(&{Map.get(&1, "original_source"), source_path(&1)})
+    |> Enum.filter(fn {source, path} -> is_binary(source) and is_binary(path) end)
+    |> Enum.uniq()
+    |> Map.new(fn {source, path} -> {source, [source | rendered_source(source, path)]} end)
+  end
+
+  defp source_path(mutant) do
+    case mutant do
+      %{"location" => %{"file" => file}} -> file
+      _other -> nil
+    end
+  end
+
+  defp rendered_source(source, path) do
+    with {:ok, language} <- Muex.Config.language_for_path(path),
+         {:ok, ast} <- language.parse(source),
+         {:ok, rendered} <- language.unparse(ast) do
+      [Audit.preserve_line_endings(rendered, source)]
+    else
+      _other -> []
+    end
+  end
+
+  defp patch_matches_sources?(entry, renderings) do
     %{"before" => before, "after" => after_source} = entry["patch"]
     original = entry["original_source"]
     mutated = entry["mutated_source"]
 
     original == mutated or
-      original
-      |> source_indentations()
-      |> Enum.any?(fn indentation ->
-        patch_replaces_source?(
-          original,
-          mutated,
-          indent_snippet(before, indentation),
-          indent_snippet(after_source, indentation)
-        )
-      end)
+      renderings
+      |> Map.fetch!(original)
+      |> Enum.any?(&patch_reconstructs_source?(&1, mutated, before, after_source))
+  end
+
+  defp patch_reconstructs_source?(original, mutated, before, after_source) do
+    original
+    |> source_indentations()
+    |> Enum.any?(fn indentation ->
+      patch_replaces_source?(
+        original,
+        mutated,
+        indent_snippet(before, indentation),
+        indent_snippet(after_source, indentation)
+      )
+    end)
   end
 
   defp patch_replaces_source?(original, mutated, before, after_source) do
