@@ -221,11 +221,6 @@ The optimizer uses 7 strategies:
 
 For detailed information, see [docs/MUTATION_OPTIMIZATION.md](docs/MUTATION_OPTIMIZATION.md).
 
-## Distributed campaigns
-
-To shard one mutation run across machines and resume it after an interruption,
-see [docs/CAMPAIGN_API.md](docs/CAMPAIGN_API.md).
-
 ### Example: Cart Project
 
 Real-world results from the shopping cart example (440 LOC, 84 tests):
@@ -237,6 +232,11 @@ Real-world results from the shopping cart example (440 LOC, 84 tests):
 | Balanced | 28 | ~10 sec | 89.29% | Development |
 
 See `examples/cart/OPTIMIZATION_RESULTS.md` for complete analysis.
+
+## Distributed campaigns
+
+To shard one mutation run across machines and resume it after an interruption,
+see [docs/CAMPAIGN_API.md](docs/CAMPAIGN_API.md).
 
 ## Equivalent Mutants, Coverage, and Incremental Runs
 

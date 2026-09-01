@@ -60,7 +60,9 @@ Build refuses the inventory unless all of these hold:
 * the inventory validates (`Muex.Audit.Validator`),
 * its source-file set equals `sources.txt` exactly,
 * its optimizer block matches `config.json`,
-* every listed source file still hashes to the inventory's `original_sha256`.
+* every source file carrying a *selected* mutation still hashes to the
+  inventory's `original_sha256` (files whose mutations were all excluded are not
+  re-hashed).
 
 The result is content-addressed. Sharding is source-file-atomic — a file's
 mutations never straddle two shards — and greedy min-work packed.
@@ -83,6 +85,12 @@ The wrapper turns one slice into one `mix muex` invocation. `mutant_ids` goes to
 a newline-delimited file; `source_files` and `test_files` are passed as
 comma-separated lists.
 
+`$GLOBAL_FINGERPRINT` is the plan's `global_fingerprint`. `$INVENTORY_KEY` is any
+campaign-wide lowercase 64-hex string that identifies the inventory the shards
+share — `sha256sum inventory.json` is the obvious choice. Anything else is
+rejected before the run starts, and `--inventory-cache-key` and
+`--inventory-cache-file` both require `--audit-dir`.
+
 ```sh
 mix muex --project-root . \
   --files "$(paste -sd, shard-1.sources)" \
@@ -97,8 +105,12 @@ mix muex --project-root . \
   --format json --report-file invocation.a1/shard-1.json
 ```
 
-The checkpoint is append-only JSONL and is the resume point: re-running the same
-shard skips every mutation already recorded there.
+The checkpoint is append-only JSONL and is the resume point: re-running the shard
+skips every mutation already recorded there. Give each attempt its own
+`invocation.<id>` directory, though — a warm inventory cache hard-links its plan
+into `--audit-dir`, so pointing a second attempt at a directory an earlier one
+already filled fails with `cannot link cached mutation plan: file already
+exists`. Keep `--checkpoint`, move `--audit-dir` and `--report-file`.
 
 `mix muex --formatter` injection means **muex must be a dependency of the target
 project** (`{:muex, path: "..."}` or a released version). A shard run against a
@@ -136,14 +148,23 @@ with `parent_selected_ids_sha256`. Child shard allocation preserves the parent's
 shard boundaries so each child shard can reuse its parent shard's inventory
 cache.
 
-Each child shard is then executed and validated exactly as in steps 4 and 5,
-against `child/`. Finally:
+Each child shard is then executed and validated as in steps 4 and 5, with one
+constraint: it must reuse its **parent** shard's `--files`, `--test-paths`,
+mutation flags and `--inventory-cache-key`, because the imported cache is bound
+to the parent's inputs. Only `--mutant-ids-file`, `--audit-dir`, `--checkpoint`,
+`--inventory-cache-file` and `--report-file` move into `child/`. A child run
+scoped to its own file list is rejected with `mutation inventory cache input
+fingerprint mismatch`. Finally:
 
 ```sh
 mix muex.continuation finalize --child child
 ```
 
-`finalize` refuses to close unless every parent mutation is accounted for.
+`finalize` refuses to close unless every parent mutation is accounted for. It
+re-validates each child shard from that shard's plan, checkpoint and report — the
+same evidence `mix muex.validate` consumes — and records the path of
+`shard-N.validation.json` without reading it; `prepare` likewise never reads the
+parent's report.
 
 ## Wrapper-owned artifacts
 
@@ -157,6 +178,7 @@ not create. The wrapper must lay it out exactly as follows.
   shard-N.files                     # relative paths, one per line, validated against snapshot/
   shard-N.checkpoint.jsonl
   inventory-cache/shard-N.etf
+  inventory-cache/shard-N.plan.json # sidecar audited plan, published with the cache
   invocation.<id>/
     shard-N-audit/plan.json
     shard-N.json                    # --report-file output
@@ -183,6 +205,11 @@ not create. The wrapper must lay it out exactly as follows.
   `[A-Za-z0-9]+`.
 * `shard-N.files` paths are relative and are re-validated against
   `<parent>/snapshot`: no absolute paths, no `.`/`..`, no symlink components.
+* `inventory-cache/shard-N.etf` and `inventory-cache/shard-N.plan.json` travel
+  together — `prepare` reads both, and a cache copied without its sidecar fails
+  with `cannot read mutation inventory cache plan`. Both are consumed through
+  `File.ln`, so the cache directory must sit on the same filesystem as the
+  `--audit-dir` of the run that reads it.
 
 `prepare` writes `continuation.plan.json`, `shard-N.ids`, `shard-N.files`, and
 the seeded `inventory-cache/` into the child directory. The child's own
@@ -205,10 +232,18 @@ mix run scripts/campaign_e2e.exs
 * `--report-file` writes the structured JSON report for every `--format`. The
   continuation flow needs that file, so it is always safe to pass.
 * Mutation IDs are stable across invocations: `Muex.mutation_id/6` over the
-  mutator, description, file, line, patch, and target ordinal.
+  mutator, description, file, line, patch, and target ordinal. It is an internal
+  helper (`@doc false`) that hashes `inspect(mutator)` and expects the patch as a
+  `%{before: _, after: _}` map; called with anything else it returns a different
+  digest instead of an error, so read IDs out of the artifacts rather than
+  recomputing them.
 * The inventory cache is Erlang term format decoded with `:safe`, which cannot
-  create atoms. `mix muex.continuation prepare` therefore parses the parent
-  snapshot sources before importing a parent cache.
+  create atoms of its own. The cache therefore carries the names of the atoms its
+  payload needs (Muex's map keys and whatever the mutators put in the cached AST)
+  as a plain list of binaries, capped at 100_000 names, which the reader interns
+  before decoding the payload. Funs, pids, and refs remain undecodable, and
+  `mix muex.continuation prepare` still parses the parent snapshot sources before
+  importing a parent cache.
 * `original_source` in the inventory is the verbatim bytes on disk, while
   `patch` and `mutated_source` are renderings of the AST. Sources that are not
   already written in their rendered form (comments, `def f, do: x`) are fully

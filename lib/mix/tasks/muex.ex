@@ -50,9 +50,13 @@ defmodule Mix.Tasks.Muex do
     * `--mutant-ids-file` - Newline-delimited stable mutation IDs for one shard
     * `--campaign-fingerprint` - Bind checkpoint evidence to an outer campaign
     * `--inventory-cache-file` / `--inventory-cache-key` - Reuse a campaign-owned
-      content-addressed inventory across shard invocations
+      content-addressed inventory across shard invocations; both are required
+      together, they require `--audit-dir`, and the key must be a lowercase
+      64-character SHA-256 digest
     * `--coverage-index-file` / `--coverage-corpus-fingerprint` - Consume a
-      campaign-owned coverage index instead of measuring coverage in-process
+      campaign-owned coverage index instead of measuring coverage in-process;
+      the index requires `--coverage-guided` and the fingerprint requires the
+      index
     * `--changed-diff-file` - Supply the `--since` diff as a file
     * `--mutator-paths` - Comma-separated directories of custom mutator modules
 

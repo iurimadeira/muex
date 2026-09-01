@@ -12,6 +12,7 @@ defmodule Muex.HardeningTest do
   alias Muex.ExUnitFormatter
   alias Muex.InventoryCache
   alias Muex.Language.Elixir, as: ElixirLanguage
+  alias Muex.MutantOptimizer
   alias Muex.Mutator.Comparison
   alias Muex.Mutator.Literal
   alias Muex.Runner
@@ -640,17 +641,50 @@ defmodule Muex.HardeningTest do
   end
 
   @tag :tmp_dir
-  test "inventory cache rejects mutation keys it does not declare", %{tmp_dir: tmp_dir} do
+  test "inventory cache round-trips optimizer-scored mutations", %{tmp_dir: tmp_dir} do
     cache = Path.join(tmp_dir, "cache/shard-1.etf")
     plan = Path.join(tmp_dir, "audit/plan.json")
+    audit = Path.join(tmp_dir, "second-audit")
     key = String.duplicate("c", 64)
-    mutation = Map.put(mutation(), :undeclared, true)
+
+    [mutation] =
+      [Map.put(mutation(), :id, String.duplicate("d", 64))]
+      |> MutantOptimizer.score_by_impact()
+
+    assert Map.has_key?(mutation, :impact_score)
 
     File.mkdir_p!(Path.dirname(plan))
     File.write!(plan, ~s({"selected_count":1}))
 
-    assert {:error, "invalid mutation inventory cache mutations"} =
+    assert {:ok, %{status: "miss"}} =
              InventoryCache.publish(cache, key, "input", [mutation], plan)
+
+    assert {:ok, [^mutation], %{status: "hit"}} =
+             InventoryCache.load(cache, key, "input", audit)
+  end
+
+  @tag :tmp_dir
+  test "inventory cache ships the atom names its payload needs", %{tmp_dir: tmp_dir} do
+    cache = Path.join(tmp_dir, "cache/shard-1.etf")
+    plan = Path.join(tmp_dir, "audit/plan.json")
+    key = String.duplicate("c", 64)
+
+    mutation =
+      mutation()
+      |> Map.put(:id, String.duplicate("d", 64))
+      |> Map.put(:ast, {:__block__, [], [[key: :cached_atom_in_list], %{cached_atom_key: 1}]})
+
+    File.mkdir_p!(Path.dirname(plan))
+    File.write!(plan, ~s({"selected_count":1}))
+
+    assert {:ok, _metadata} = InventoryCache.publish(cache, key, "input", [mutation], plan)
+
+    assert {names, payload} = :erlang.binary_to_term(File.read!(cache), [:safe])
+    assert is_binary(payload)
+    assert Enum.all?(names, &is_binary/1)
+
+    for name <- ~w(__block__ key cached_atom_in_list cached_atom_key location file),
+        do: assert(name in names)
   end
 
   @tag :tmp_dir

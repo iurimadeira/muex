@@ -331,16 +331,26 @@ defmodule Muex.Audit.Validator do
   # already written in its rendered form only reconstructs against that rendering.
   defp original_renderings(mutants) do
     mutants
-    |> Enum.map(&Map.get(&1, "original_source"))
-    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&{Map.get(&1, "original_source"), source_path(&1)})
+    |> Enum.filter(fn {source, path} -> is_binary(source) and is_binary(path) end)
     |> Enum.uniq()
-    |> Map.new(&{&1, [&1 | rendered_source(&1)]})
+    |> Map.new(fn {source, path} -> {source, [source | rendered_source(source, path)]} end)
   end
 
-  defp rendered_source(source) do
-    case Code.string_to_quoted(source) do
-      {:ok, ast} -> [Audit.preserve_line_endings(Macro.to_string(ast), source)]
-      {:error, _reason} -> []
+  defp source_path(mutant) do
+    case mutant do
+      %{"location" => %{"file" => file}} -> file
+      _other -> nil
+    end
+  end
+
+  defp rendered_source(source, path) do
+    with {:ok, language} <- Muex.Config.language_for_path(path),
+         {:ok, ast} <- language.parse(source),
+         {:ok, rendered} <- language.unparse(ast) do
+      [Audit.preserve_line_endings(rendered, source)]
+    else
+      _other -> []
     end
   end
 

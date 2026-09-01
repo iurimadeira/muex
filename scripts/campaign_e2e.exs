@@ -9,7 +9,7 @@
 # Exits non-zero on the first step that fails.
 
 muex_root = File.cwd!()
-root = Path.join(System.tmp_dir!(), "muex-campaign-e2e-#{System.unique_integer([:positive])}")
+root = Path.join(System.tmp_dir!(), "muex-campaign-e2e-#{System.system_time(:nanosecond)}")
 
 defmodule E2E do
   def run!(root, args, env \\ []) do
@@ -44,7 +44,10 @@ defmodule E2E do
   end
 end
 
-mutation_args = ~w(--mutators return_value --min-complexity 0 --no-filter)
+# `literal` puts an atom the mutator synthesizes (`:mutated_atom`) inside the
+# cached AST: a name that exists in neither the snapshot sources nor any module
+# a continuation VM loads.
+mutation_args = ~w(--mutators return_value,literal --min-complexity 0 --no-filter)
 
 E2E.step("fixture project at #{root}", fn ->
   E2E.write!(root, "mix.exs", """
@@ -62,7 +65,9 @@ E2E.step("fixture project at #{root}", fn ->
   """)
 
   # Deliberately not written in its rendered form: a comment and a keyword-form
-  # body, which the audit inventory has to stay verifiable against.
+  # body, which the audit inventory has to stay verifiable against. The
+  # `zzz_e2e_*` names exist nowhere in Muex, so a continuation VM can only decode
+  # a cache carrying them when the cache format ships its own atom manifest.
   E2E.write!(root, "lib/example.ex", """
   defmodule CampaignE2E.Example do
     # keyword form plus a comment
@@ -71,6 +76,8 @@ E2E.step("fixture project at #{root}", fn ->
     def other do
       :second
     end
+
+    def zzz_e2e_unlikely_name, do: :zzz_e2e_unlikely_atom
   end
   """)
 
@@ -81,6 +88,9 @@ E2E.step("fixture project at #{root}", fn ->
     use ExUnit.Case
     test "value", do: assert(CampaignE2E.Example.value() == :original)
     test "other", do: assert(CampaignE2E.Example.other() == :second)
+
+    test "unlikely",
+      do: assert(CampaignE2E.Example.zzz_e2e_unlikely_name() == :zzz_e2e_unlikely_atom)
   end
   """)
 

@@ -75,13 +75,17 @@ defmodule Muex.Config do
       the shard-scoped form of `--mutant-id`
     * `--campaign-fingerprint` - Bind checkpoint evidence to an outer campaign
     * `--inventory-cache-file` / `--inventory-cache-key` - Reuse a
-      campaign-owned, content-addressed mutation inventory and audited plan
+      campaign-owned, content-addressed mutation inventory and audited plan;
+      both are required together, they require `--audit-dir`, and the key must
+      be a lowercase 64-character SHA-256 digest
     * `--project-root` - Anchor for every relative path (default: derived from
       `--files`)
     * `--audit-only` / `--audit-plan` - Publish the optimized inventory to the
       given exact path without running any test or mutant
     * `--coverage-index-file` / `--coverage-corpus-fingerprint` - Consume a
-      campaign-owned coverage index instead of measuring coverage in-process
+      campaign-owned coverage index instead of measuring coverage in-process;
+      the index requires `--coverage-guided` and the fingerprint requires the
+      index
     * `--changed-diff-file` - Supply the `--since` diff as a file instead of
       shelling out to git
     * `--preset` - Framework preset that prunes noisy DSL calls: `phoenix`,
@@ -513,6 +517,27 @@ defmodule Muex.Config do
     case Code.ensure_loaded(module) do
       {:module, ^module} -> {:ok, module}
       _ -> {:error, "Unknown language: #{name}"}
+    end
+  end
+
+  @doc false
+  def language_for_path(path) do
+    extension = Path.extname(path)
+
+    @language_map
+    |> Map.values()
+    |> Enum.uniq()
+    |> Enum.find_value(fn module ->
+      with {:module, ^module} <- Code.ensure_loaded(module),
+           true <- extension in module.file_extensions() do
+        module
+      else
+        _other -> nil
+      end
+    end)
+    |> case do
+      nil -> {:error, "no language adapter for #{extension}"}
+      module -> {:ok, module}
     end
   end
 
