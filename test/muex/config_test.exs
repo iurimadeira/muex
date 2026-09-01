@@ -9,6 +9,8 @@ defmodule Muex.ConfigTest do
       assert config.files == ["lib"]
       assert config.test_paths == ["test"]
       assert config.app == nil
+      assert config.project_root == File.cwd!()
+      assert config.skip_calls == []
       assert config.language == Muex.Language.Elixir
       assert config.filter == true
       assert config.verbose == false
@@ -21,14 +23,33 @@ defmodule Muex.ConfigTest do
       assert config.min_score == 20
       assert config.min_complexity == nil
       assert config.max_per_function == nil
-      assert config.tce == true
+      assert config.tce == false
       assert config.since == nil
       assert config.coverage_guided == false
+      assert config.internal.audit_only == false
+      assert config.internal.audit_plan == nil
       assert Muex.Mutator.Literal in config.mutators
       assert Muex.Mutator.StatementDeletion in config.mutators
       assert Muex.Mutator.ReturnValue in config.mutators
       # 8 original mutators + 10 ported Elixir-specific mutators
       assert length(config.mutators) == 18
+    end
+
+    test "audit-only requires an exact audit plan output" do
+      assert {:error, "--audit-only requires --audit-plan"} =
+               Config.from_args(["--audit-only"])
+
+      assert {:error, "--audit-only requires --audit-plan"} =
+               Config.from_args(["--audit-only", "--audit-plan", ""])
+
+      assert {:error, "--audit-plan requires --audit-only"} =
+               Config.from_args(["--audit-plan", "tmp/inventory.json"])
+
+      assert {:ok, config} =
+               Config.from_args(["--audit-only", "--audit-plan", "tmp/inventory.json"])
+
+      assert config.internal.audit_only
+      assert config.internal.audit_plan == "tmp/inventory.json"
     end
 
     test "parses --files flag" do
@@ -139,9 +160,9 @@ defmodule Muex.ConfigTest do
       assert config.tce == false
     end
 
-    test "parses --tce explicitly" do
-      assert {:ok, config} = Config.from_args(["--tce"])
-      assert config.tce == true
+    test "rejects --tce because compiler equivalence is unsound" do
+      assert {:error, message} = Config.from_args(["--tce"])
+      assert message =~ "compiler-equivalence detection is not sound"
     end
 
     test "parses --since" do

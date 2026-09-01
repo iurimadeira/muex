@@ -233,6 +233,11 @@ Real-world results from the shopping cart example (440 LOC, 84 tests):
 
 See `examples/cart/OPTIMIZATION_RESULTS.md` for complete analysis.
 
+## Distributed campaigns
+
+To shard one mutation run across machines and resume it after an interruption,
+see [docs/CAMPAIGN_API.md](docs/CAMPAIGN_API.md).
+
 ## Equivalent Mutants, Coverage, and Incremental Runs
 
 In addition to the (lossy) optimizer above, Muex applies sound, always-on

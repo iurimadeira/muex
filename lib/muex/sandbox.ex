@@ -25,6 +25,7 @@ defmodule Muex.Sandbox do
   """
 
   @type sandbox :: %{
+          optional(:owner_token) => String.t(),
           root: Path.t(),
           project_root: Path.t(),
           build_env: String.t()
@@ -47,10 +48,15 @@ defmodule Muex.Sandbox do
       Path.join(System.tmp_dir!(), "muex_sandboxes_#{System.system_time(:millisecond)}_#{unique}")
 
     File.mkdir_p!(base_dir)
+    owner_token = 32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    File.write!(Path.join(base_dir, ".muex-owned"), owner_token, [:binary, :exclusive, :sync])
 
     for i <- 1..count do
       root = Path.join(base_dir, "worker_#{i}")
-      create_sandbox(root, project_root, build_env, test_paths)
+
+      root
+      |> create_sandbox(project_root, build_env, test_paths)
+      |> Map.put(:owner_token, owner_token)
     end
   end
 
@@ -77,7 +83,15 @@ defmodule Muex.Sandbox do
     end
 
     # Symlink test directories (for explicit --test-paths)
-    link_test_paths(root, project_root, test_paths)
+    link_test_paths(
+      root,
+      project_root,
+      [
+        Path.join(project_root, "test/support"),
+        Path.join(project_root, "test/test_helper.exs")
+        | test_paths
+      ]
+    )
 
     # Symlink deps/ (shared, read-only)
     safe_symlink(Path.join(project_root, "deps"), Path.join(root, "deps"))
@@ -88,6 +102,19 @@ defmodule Muex.Sandbox do
     setup_build_dir(root, project_root, build_env)
 
     %{root: root, project_root: project_root, build_env: build_env}
+  end
+
+  @doc "Makes every mutated application's build artifacts private to this sandbox."
+  @spec prepare(sandbox(), [Path.t()]) :: :ok | {:error, term()}
+  def prepare(sandbox, file_paths) do
+    file_paths
+    |> Enum.uniq()
+    |> Enum.reduce_while(:ok, fn file_path, :ok ->
+      case ensure_build_copy_for_file(sandbox, file_path) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
   end
 
   @doc """
@@ -103,31 +130,15 @@ defmodule Muex.Sandbox do
   def apply_mutation(sandbox, original_path, mutated_source, module_name) do
     sandbox_path = Path.join(sandbox.root, original_path)
 
-    # For umbrella projects: ensure the app containing the mutated file
-    # has been mirrored (symlink replaced with file-level copies) so we
-    # can swap individual source files.
-    ensure_app_mirrored_for_file(sandbox, original_path)
-
-    # Ensure the mutated app's build dir is a real copy (not a symlink)
-    # so this sandbox can recompile independently.
-    ensure_build_copy_for_file(sandbox, original_path)
-
-    # Remove the symlink and write the mutated source as a real file
-    File.rm(sandbox_path)
-
-    case File.write(sandbox_path, mutated_source) do
-      :ok ->
-        # Delete the stale .beam so the child `mix test` process detects
-        # the source change and recompiles the module. Pre-compiling via
-        # Code.compile_string in the parent VM is not viable: modules with
-        # compile-time dependencies (use, import, structs) fail, and
-        # successful compilations pollute the parent's module state.
-        if module_name, do: remove_stale_beam(sandbox, original_path, module_name)
-
-        {:ok, false}
-
-      {:error, reason} ->
-        {:error, reason}
+    with :ok <- validate_private_root(sandbox),
+         :ok <- reset_runtime_temp(sandbox),
+         :ok <- verify_source(sandbox, original_path),
+         :ok <- ensure_app_mirrored_for_file(sandbox, original_path),
+         :ok <- ensure_build_copy_for_file(sandbox, original_path),
+         :ok <- File.rm(sandbox_path),
+         :ok <- File.write(sandbox_path, mutated_source) do
+      if module_name, do: remove_stale_beam(sandbox, original_path, module_name)
+      {:ok, false}
     end
   end
 
@@ -135,17 +146,24 @@ defmodule Muex.Sandbox do
   Restores a sandbox after a mutation by copying the original source file
   back over the mutated copy.
   """
-  @spec restore(sandbox(), Path.t()) :: :ok
+  @spec restore(sandbox(), Path.t()) :: :ok | {:error, term()}
   def restore(sandbox, original_path) do
     sandbox_path = Path.join(sandbox.root, original_path)
     project_path = Path.join(sandbox.project_root, original_path)
 
-    # Copy the original source back over the mutated file.
-    # (The app dir is a COW copy, not symlinks, so we overwrite in place.)
-    File.rm(sandbox_path)
-    File.cp!(project_path, sandbox_path)
+    with :ok <- validate_private_root(sandbox),
+         :ok <- File.rm(sandbox_path),
+         :ok <- validate_private_root(sandbox),
+         :ok <- File.cp(project_path, sandbox_path),
+         :ok <- verify_restored_source(sandbox_path, project_path, original_path) do
+      reset_runtime_temp(sandbox)
+    end
+  end
 
-    :ok
+  defp verify_restored_source(sandbox_path, project_path, original_path) do
+    if digest_file(sandbox_path) == digest_file(project_path),
+      do: :ok,
+      else: {:error, {:sandbox_source_restore_hash_mismatch, original_path}}
   end
 
   @doc """
@@ -156,7 +174,11 @@ defmodule Muex.Sandbox do
     case sandboxes do
       [%{root: first_root} | _] ->
         base_dir = Path.dirname(first_root)
-        File.rm_rf!(base_dir)
+
+        if File.exists?(base_dir) do
+          Enum.each(sandboxes, &validate_private_root!/1)
+          File.rm_rf!(base_dir)
+        end
 
       [] ->
         :ok
@@ -165,10 +187,54 @@ defmodule Muex.Sandbox do
     :ok
   end
 
+  @doc false
+  def rebuild(sandbox, file_paths, test_paths) do
+    with :ok <- validate_private_root(sandbox) do
+      File.rm_rf!(sandbox.root)
+
+      rebuilt =
+        sandbox.root
+        |> create_sandbox(sandbox.project_root, sandbox.build_env, test_paths)
+        |> Map.put(:owner_token, sandbox.owner_token)
+
+      with :ok <- prepare(rebuilt, file_paths), do: {:ok, rebuilt}
+    end
+  end
+
+  @doc false
+  def validate_private_root(%{root: root, owner_token: owner_token})
+      when is_binary(owner_token) do
+    temp = canonical_existing(System.tmp_dir!())
+    root = Path.expand(root)
+    base = Path.dirname(root)
+    marker = Path.join(base, ".muex-owned")
+
+    with {:ok, canonical_base} <- canonical_existing_result(base),
+         true <- canonical_base == base,
+         true <- Path.dirname(base) == temp,
+         true <- String.starts_with?(Path.basename(base), "muex_sandboxes_"),
+         true <- Regex.match?(~r/^worker_[1-9][0-9]*$/, Path.basename(root)),
+         true <- safe_root?(root, base),
+         {:ok, ^owner_token} <- File.read(marker) do
+      :ok
+    else
+      _failure -> {:error, {:unsafe_sandbox_root, root}}
+    end
+  end
+
+  def validate_private_root(%{root: root}), do: {:error, {:unsafe_sandbox_root, root}}
+
+  defp validate_private_root!(sandbox) do
+    case validate_private_root(sandbox) do
+      :ok -> :ok
+      {:error, reason} -> raise ArgumentError, inspect(reason)
+    end
+  end
+
   # -- Private helpers --
 
   defp symlink_top_level(root, project_root) do
-    top_level_files = ~w(mix.exs mix.lock .formatter.exs .credo.exs)
+    top_level_files = ~w(mix.exs mix.lock .formatter.exs .credo.exs .tool-versions)
 
     for file <- top_level_files do
       source = Path.join(project_root, file)
@@ -186,6 +252,59 @@ defmodule Muex.Sandbox do
       if File.dir?(source) do
         safe_symlink(source, Path.join(root, dir))
       end
+    end
+  end
+
+  defp digest_file(path) do
+    path |> File.read!() |> then(&:crypto.hash(:sha256, &1))
+  end
+
+  defp canonical_existing(path) do
+    {:ok, canonical} = canonical_existing_result(path)
+    canonical
+  end
+
+  defp canonical_existing_result(path) do
+    case System.cmd("realpath", ["-e", path], stderr_to_stdout: true) do
+      {canonical, 0} -> {:ok, String.trim(canonical)}
+      {_message, _status} -> {:error, :not_canonical}
+    end
+  end
+
+  defp safe_root?(root, base) do
+    case File.lstat(root) do
+      {:ok, %{type: :symlink}} ->
+        false
+
+      {:ok, _stat} ->
+        case canonical_existing_result(root) do
+          {:ok, canonical} -> Path.dirname(canonical) == base
+          {:error, _reason} -> false
+        end
+
+      {:error, :enoent} ->
+        true
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp verify_source(sandbox, original_path) do
+    sandbox_path = Path.join(sandbox.root, original_path)
+    project_path = Path.join(sandbox.project_root, original_path)
+
+    if digest_file(sandbox_path) == digest_file(project_path),
+      do: :ok,
+      else: {:error, {:sandbox_source_hash_mismatch, original_path}}
+  end
+
+  defp reset_runtime_temp(sandbox) do
+    runtime_temp = Path.join(sandbox.root, "tmp")
+
+    with :ok <- validate_private_root(sandbox) do
+      File.rm_rf!(runtime_temp)
+      File.mkdir_p(runtime_temp)
     end
   end
 
@@ -392,7 +511,7 @@ defmodule Muex.Sandbox do
   defp remove_stale_beam(sandbox, file_path, module_name) do
     with app_name when is_binary(app_name) <-
            extract_app_name_from_path(file_path, sandbox.project_root, sandbox.build_env),
-         app_build <-
+         app_build =
            Path.join([sandbox.root, "_build", sandbox.build_env, "lib", app_name]),
          {:error, _} <- File.read_link(app_build) do
       app_build
@@ -406,8 +525,15 @@ defmodule Muex.Sandbox do
 
   defp ensure_app_mirrored_for_file(sandbox, file_path) do
     case extract_app_name_from_path(file_path, sandbox.project_root, sandbox.build_env) do
-      nil -> :ok
-      app_name -> ensure_app_mirrored(sandbox, app_name)
+      nil ->
+        {:error, {:app_not_detected, file_path}}
+
+      app_name ->
+        if File.dir?(Path.join(sandbox.project_root, "apps")) do
+          ensure_app_mirrored(sandbox, app_name)
+        end
+
+        :ok
     end
   end
 
@@ -415,10 +541,10 @@ defmodule Muex.Sandbox do
   # name ("supply_chain") and ensure its _build/test/lib/<app> directory
   # is a real deep copy (not a symlink) so we can delete its beam files.
   defp ensure_build_copy_for_file(sandbox, file_path) do
-    app_name =
-      extract_app_name_from_path(file_path, sandbox.project_root, sandbox.build_env)
-
-    if app_name, do: ensure_build_copy(sandbox, app_name)
+    case extract_app_name_from_path(file_path, sandbox.project_root, sandbox.build_env) do
+      nil -> {:error, {:app_not_detected, file_path}}
+      app_name -> ensure_build_copy(sandbox, app_name)
+    end
   end
 
   defp extract_app_name_from_path(file_path, project_root, build_env) do
@@ -548,14 +674,23 @@ defmodule Muex.Sandbox do
     # the sandbox's own build env rather than assuming "test".
     lib_dir = Path.join([project_build_root(project_root), build_env, "lib"])
 
-    case Path.wildcard(Path.join([lib_dir, "*", ".mix", "compile.elixir"]), match_dot: true) do
-      [path] ->
-        path |> Path.relative_to(lib_dir) |> Path.split() |> List.first()
+    configured_app =
+      if Code.ensure_loaded?(Mix.Project) do
+        Mix.Project.config()[:app]
+      end
 
-      _ ->
-        # Either nothing is built yet, or this is an umbrella and the file path
-        # did not name an app. Guessing would target the wrong one.
-        nil
+    configured_path =
+      if configured_app do
+        Path.join(lib_dir, Atom.to_string(configured_app))
+      end
+
+    if configured_path && File.dir?(configured_path) do
+      Atom.to_string(configured_app)
+    else
+      case Path.wildcard(Path.join([lib_dir, "*", ".mix", "compile.elixir"]), match_dot: true) do
+        [path] -> path |> Path.relative_to(lib_dir) |> Path.split() |> List.first()
+        _ -> nil
+      end
     end
   end
 
@@ -581,16 +716,29 @@ defmodule Muex.Sandbox do
         app_name
       ])
 
-    # If it's a symlink, replace with a deep copy
-    case File.read_link(target_app_build) do
-      {:ok, _} ->
-        # It's a symlink — replace with a real copy
+    cond do
+      not File.dir?(source_app_build) ->
+        {:error, {:app_build_missing, source_app_build}}
+
+      match?({:ok, _}, File.read_link(target_app_build)) ->
         File.rm!(target_app_build)
         deep_copy(source_app_build, target_app_build)
+        verify_private_build(target_app_build)
 
-      {:error, _} ->
-        # Already a real directory (from a previous mutation on same app)
-        :ok
+      File.dir?(target_app_build) ->
+        verify_private_build(target_app_build)
+
+      true ->
+        deep_copy(source_app_build, target_app_build)
+        verify_private_build(target_app_build)
+    end
+  end
+
+  defp verify_private_build(path) do
+    if File.dir?(path) and not match?({:ok, _}, File.read_link(path)) do
+      :ok
+    else
+      {:error, {:app_build_not_isolated, path}}
     end
   end
 

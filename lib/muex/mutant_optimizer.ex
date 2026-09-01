@@ -5,25 +5,19 @@ defmodule Muex.MutantOptimizer do
 
   This module implements several strategies:
 
-  1. **Equivalent Mutant Detection**: Identifies mutations that are semantically
-     equivalent to the original code (e.g., `x + 0` → `x - 0`)
-
-  2. **Impact Analysis**: Prioritizes mutations in complex, frequently-tested code
+  1. **Impact Analysis**: Prioritizes mutations in complex, frequently-tested code
      over simple getters or trivial functions
 
-  3. **Mutation Clustering**: Groups similar mutations and tests only representative
-     samples from each cluster
+  2. **Selection Audit**: Exposes each optimizer stage without claiming
+     similarity that has not been measured
 
-  4. **Code Complexity Scoring**: Focuses on mutations in code with higher cyclomatic
+  3. **Code Complexity Scoring**: Focuses on mutations in code with higher cyclomatic
      complexity, where bugs are more likely
 
-  5. **Pattern-Based Filtering**: Removes mutations known to be low-value based on
-     AST patterns (e.g., mutating literal `0` in arithmetic identity operations)
-
-  6. **Boundary Value Focus**: Prioritizes mutations at decision boundaries (>=, <=, ==)
+  4. **Boundary Value Focus**: Prioritizes mutations at decision boundaries (>=, <=, ==)
      over less critical operators
 
-  7. **Guard Clause Deprioritization**: Reduces mutation testing on simple validation
+  5. **Guard Clause Deprioritization**: Reduces mutation testing on simple validation
      guards that are typically well-covered by tests
   """
 
@@ -38,7 +32,6 @@ defmodule Muex.MutantOptimizer do
           enabled: boolean(),
           min_complexity: non_neg_integer(),
           max_mutations_per_function: non_neg_integer(),
-          cluster_similarity_threshold: float(),
           keep_boundary_mutations: boolean()
         ]
 
@@ -50,7 +43,6 @@ defmodule Muex.MutantOptimizer do
   - `:enabled` - Enable optimization (default: false)
   - `:min_complexity` - Minimum complexity score to mutate (default: 2)
   - `:max_mutations_per_function` - Maximum mutations per function (default: 20)
-  - `:cluster_similarity_threshold` - Similarity threshold for clustering (default: 0.8)
   - `:keep_boundary_mutations` - Always keep boundary condition mutations (default: true)
 
   ## Returns
@@ -60,29 +52,45 @@ defmodule Muex.MutantOptimizer do
   @spec optimize(list(mutation()), filter_options()) :: list(mutation())
   def optimize(mutations, opts \\ []) do
     if Keyword.get(opts, :enabled, false) do
-      mutations
-      |> filter_equivalent_mutants()
-      |> score_by_impact()
-      |> filter_by_complexity(Keyword.get(opts, :min_complexity, 2))
-      |> cluster_and_sample(Keyword.get(opts, :cluster_similarity_threshold, 0.8))
-      |> limit_per_function(Keyword.get(opts, :max_mutations_per_function, 20))
-      |> prioritize_boundary_mutations(Keyword.get(opts, :keep_boundary_mutations, true))
+      mutations |> optimization_stages(opts) |> Map.fetch!(:prioritized)
     else
       mutations
     end
   end
 
   @doc """
-  Filters out mutations that are likely to be equivalent to the original code.
+  Returns every optimizer stage so callers can audit the exact selection reason.
 
-  Detects patterns like:
-  - `x + 0` → `x - 0` (arithmetic identity)
-  - `x * 1` → `x / 1` (multiplicative identity)
-  - `true and x` → `true or x` (boolean short-circuit)
-  - Empty list mutations `[]` → `[]`
+  Equivalence hooks and heuristic equivalence detectors are deliberately absent.
+  They have produced false positives; only a generated source that is byte-identical
+  to the original may be classified separately as a no-op by the worker.
   """
-  def filter_equivalent_mutants(mutations) do
-    Enum.reject(mutations, &equivalent_mutant?/1)
+  @spec optimization_stages(list(mutation()), filter_options()) :: map()
+  def optimization_stages(mutations, opts \\ []) do
+    keep_boundary = Keyword.get(opts, :keep_boundary_mutations, true)
+    scored = score_by_impact(mutations)
+
+    complexity =
+      scored
+      |> filter_by_complexity(Keyword.get(opts, :min_complexity, 2))
+      |> preserve_boundary_mutations(scored, keep_boundary)
+
+    clustered = cluster_and_sample(complexity, nil)
+
+    limited =
+      clustered
+      |> limit_per_function(Keyword.get(opts, :max_mutations_per_function, 20))
+      |> preserve_boundary_mutations(scored, keep_boundary)
+
+    prioritized = prioritize_boundary_mutations(limited, keep_boundary)
+
+    %{
+      scored: scored,
+      complexity: complexity,
+      clustered: clustered,
+      limited: limited,
+      prioritized: prioritized
+    }
   end
 
   @doc """
@@ -118,19 +126,13 @@ defmodule Muex.MutantOptimizer do
   end
 
   @doc """
-  Groups similar mutations and samples representatives from each cluster.
+  Compatibility stage that conserves all mutations.
 
-  This reduces redundant mutations that test the same code path.
-  For example, if a function has 10 arithmetic operations, we don't
-  need to test all possible `+` → `-` mutations.
+  Muex does not currently calculate semantic or behavioral similarity, so this
+  stage cannot soundly discard representative-looking mutants. The threshold
+  argument remains accepted for callers using the previous API.
   """
-  def cluster_and_sample(mutations, similarity_threshold) do
-    mutations
-    |> group_by_function()
-    |> Enum.flat_map(fn {_function, group} ->
-      cluster_similar_mutations(group, similarity_threshold)
-    end)
-  end
+  def cluster_and_sample(mutations, _similarity_threshold), do: mutations
 
   @doc """
   Limits the number of mutations per function to prevent explosion.
@@ -163,10 +165,6 @@ defmodule Muex.MutantOptimizer do
   end
 
   # Private helper functions
-
-  defp equivalent_mutant?(mutation) do
-    Muex.Mutator.equivalent?(mutation)
-  end
 
   defp get_mutator_name(mutator) when is_atom(mutator) do
     mutator
@@ -299,7 +297,7 @@ defmodule Muex.MutantOptimizer do
   defp count_decision_points(ast) when is_tuple(ast), do: 0
 
   defp count_decision_points(list) when is_list(list) do
-    Enum.map(list, &count_decision_points/1) |> Enum.sum()
+    list |> Enum.map(&count_decision_points/1) |> Enum.sum()
   end
 
   defp count_decision_points(_), do: 0
@@ -315,47 +313,27 @@ defmodule Muex.MutantOptimizer do
     end)
   end
 
-  defp cluster_similar_mutations(mutations, _similarity_threshold) do
-    # Cluster by mutator type and keep representative samples
-    mutations
-    |> Enum.group_by(fn m -> get_mutator_name(m.mutator) end)
-    |> Enum.flat_map(fn {_mutator, group} ->
-      # For each mutator type, sample based on uniqueness
-      sample_diverse_mutations(group)
-    end)
+  defp preserve_boundary_mutations(selected, original, true) do
+    boundary = Enum.filter(original, &boundary_mutation?/1)
+    boundary ++ Enum.reject(selected, &(&1 in boundary))
   end
 
-  defp sample_diverse_mutations(mutations) when length(mutations) <= 3 do
-    # Keep all if small group
-    mutations
-  end
+  defp preserve_boundary_mutations(selected, _original, false), do: selected
 
-  defp sample_diverse_mutations(mutations) do
-    # Keep highest impact and diverse samples
-    sorted = Enum.sort_by(mutations, & &1.impact_score, :desc)
-
-    # Take top 33% and at least 2 samples
-    sample_size = max(2, div(length(mutations), 3))
-    Enum.take(sorted, sample_size)
-  end
-
-  defp boundary_mutation?(%{mutator: mutator, ast: ast}) do
-    if get_mutator_name(mutator) == "Comparison" do
-      case ast do
-        {:>=, _, _} -> true
-        {:<=, _, _} -> true
-        {:==, _, _} -> true
-        {:!=, _, _} -> true
-        {:!==, _, _} -> true
-        {:===, _, _} -> true
-        _ -> false
-      end
-    else
-      false
-    end
+  defp boundary_mutation?(%{mutator: mutator} = mutation) do
+    get_mutator_name(mutator) == "Comparison" and
+      Enum.any?(
+        [Map.get(mutation, :original_ast), Map.get(mutation, :ast)],
+        &boundary_operator?/1
+      )
   end
 
   defp boundary_mutation?(_), do: false
+
+  defp boundary_operator?({operator, _, _}) when operator in [:>=, :<=, :==, :!=, :!==, :===],
+    do: true
+
+  defp boundary_operator?(_ast), do: false
 
   @doc """
   Generates a summary report of the optimization results.
@@ -367,7 +345,8 @@ defmodule Muex.MutantOptimizer do
     reduction_pct = if original_count > 0, do: reduction / original_count * 100, else: 0.0
 
     by_mutator =
-      Enum.frequencies_by(optimized_mutations, fn m -> get_mutator_name(m.mutator) end)
+      optimized_mutations
+      |> Enum.frequencies_by(fn m -> get_mutator_name(m.mutator) end)
       |> Enum.sort_by(fn {_, count} -> -count end)
 
     avg_impact =

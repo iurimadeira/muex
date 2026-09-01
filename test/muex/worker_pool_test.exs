@@ -28,7 +28,7 @@ defmodule Muex.WorkerPoolTest do
       }
 
       results =
-        WorkerPool.run_mutations(
+        WorkerPool.run_mutations_result(
           pool,
           [],
           file_entry,
@@ -38,8 +38,24 @@ defmodule Muex.WorkerPoolTest do
           timeout_ms: 1000
         )
 
-      assert results == []
+      assert results == {:ok, []}
+
+      assert [] =
+               WorkerPool.run_mutations(
+                 pool,
+                 [],
+                 file_entry,
+                 Muex.Language.Elixir,
+                 %{},
+                 %{},
+                 timeout_ms: 1000
+               )
+
       GenServer.stop(pool)
     end
+  end
+
+  test "Runner.run_all/6 preserves the v0.9.1 list return" do
+    assert [] = Muex.Runner.run_all([], %{}, Muex.Language.Elixir, %{}, %{}, [])
   end
 end

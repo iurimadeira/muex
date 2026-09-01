@@ -63,18 +63,31 @@ defmodule Muex.FileAnalyzer do
   """
   @spec filter_files([map()], keyword()) :: {[map()], [map()]}
   def filter_files(files, opts \\ []) do
+    {included, excluded, _decisions} = filter_files_with_reasons(files, opts)
+    {included, excluded}
+  end
+
+  @doc false
+  @spec filter_files_with_reasons([map()], keyword()) :: {[map()], [map()], %{Path.t() => map()}}
+  def filter_files_with_reasons(files, opts \\ []) do
     min_score = Keyword.get(opts, :min_score, 20)
     verbose = Keyword.get(opts, :verbose, false)
 
-    {included, excluded} =
-      Enum.split_with(files, fn file ->
+    {included, excluded, decisions} =
+      Enum.reduce(files, {[], [], %{}}, fn file, {included, excluded, decisions} ->
         case analyze_file(file) do
           {:ok, score} when score >= min_score ->
             if verbose do
               Mix.shell().info("  ✓ #{Path.relative_to_cwd(file.path)} (score: #{score})")
             end
 
-            true
+            decision = %{
+              selected: true,
+              selection_reason: "selected_by_file_filter",
+              filter_score: score
+            }
+
+            {[file | included], excluded, Map.put(decisions, file.path, decision)}
 
           {:ok, score} ->
             if verbose do
@@ -83,18 +96,31 @@ defmodule Muex.FileAnalyzer do
               )
             end
 
-            false
+            decision = %{
+              selected: false,
+              selection_reason: "excluded_by_file_filter",
+              filter_reason: "score_below_threshold",
+              filter_score: score
+            }
+
+            {included, [file | excluded], Map.put(decisions, file.path, decision)}
 
           {:skip, reason} ->
             if verbose do
               Mix.shell().info("  ✗ #{Path.relative_to_cwd(file.path)} (#{reason})")
             end
 
-            false
+            decision = %{
+              selected: false,
+              selection_reason: "excluded_by_file_filter",
+              filter_reason: reason
+            }
+
+            {included, [file | excluded], Map.put(decisions, file.path, decision)}
         end
       end)
 
-    {included, excluded}
+    {Enum.reverse(included), Enum.reverse(excluded), decisions}
   end
 
   # Check if module is a Mix task

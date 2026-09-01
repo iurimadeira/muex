@@ -114,7 +114,7 @@ defmodule Muex.LoaderTest do
       assert file.module_name == nil
     end
 
-    test "skips files with parse errors", %{tmp_dir: tmp_dir} do
+    test "fails fast with the path when a source cannot be parsed", %{tmp_dir: tmp_dir} do
       File.write!(Path.join(tmp_dir, "good.ex"), """
       defmodule Good do
         def foo, do: :ok
@@ -128,12 +128,10 @@ defmodule Muex.LoaderTest do
       end
       """)
 
-      {:ok, files} = Loader.load(tmp_dir, ElixirAdapter)
+      bad = Path.join(tmp_dir, "bad.ex")
 
-      # Should only load the good file
-      assert [_] = files
-      assert [file] = files
-      assert file.module_name == Good
+      assert {:error, {:source_load_failed, ^bad, _reason}} =
+               Loader.load(tmp_dir, ElixirAdapter)
     end
 
     test "returns empty list when no files found", %{tmp_dir: tmp_dir} do

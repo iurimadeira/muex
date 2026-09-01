@@ -16,12 +16,19 @@ defmodule Muex.WorkerPool do
   """
 
   use GenServer
-  require Logger
 
-  alias Muex.{Compiler, Config, Coverage, DependencyAnalyzer, Reporter, Sandbox, Tce}
+  alias Muex.Checkpoint
+  alias Muex.Compiler
+  alias Muex.Config
+  alias Muex.Coverage
+  alias Muex.Reporter
+  alias Muex.Sandbox
   alias Muex.TestRunner.Port, as: PortRunner
 
+  require Logger
+
   @default_max_workers 4
+  @worker_shutdown_timeout_ms 2_000
 
   # `State` legitimately wraps opaque values (`MapSet`, `:queue`). Across the
   # self-recursive `schedule_workers/1` call, Dialyzer cannot keep a consistent
@@ -49,6 +56,7 @@ defmodule Muex.WorkerPool do
             opts: keyword(),
             project_root: Path.t() | nil,
             test_paths: [Path.t()],
+            baseline_test_paths: [Path.t()],
             pending_by_file: map(),
             locked_files: MapSet.t(),
             active_workers: map(),
@@ -72,6 +80,7 @@ defmodule Muex.WorkerPool do
       project_root: nil,
       # Expanded test file paths (resolved once at run start)
       test_paths: ["test"],
+      baseline_test_paths: ["test"],
       # Map of file_path => :queue.queue(mutation)
       pending_by_file: %{},
       # MapSet of file paths currently being mutated
@@ -143,7 +152,7 @@ defmodule Muex.WorkerPool do
 
   ## Returns
 
-    List of mutation results.
+    List of mutation result maps.
   """
   @spec run_mutations(
           pid(),
@@ -163,6 +172,32 @@ defmodule Muex.WorkerPool do
         file_to_module,
         opts \\ []
       ) do
+    case run_mutations_result(
+           pool,
+           mutations,
+           file_entries,
+           language_adapter,
+           dependency_map,
+           file_to_module,
+           opts
+         ) do
+      {:ok, results} -> results
+      {:error, reason} -> raise "mutation run failed: #{inspect(reason)}"
+    end
+  end
+
+  @doc false
+  @spec run_mutations_result(pid(), [map()], map(), module(), map(), map(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def run_mutations_result(
+        pool,
+        mutations,
+        file_entries,
+        language_adapter,
+        dependency_map,
+        file_to_module,
+        opts \\ []
+      ) do
     GenServer.call(
       pool,
       {:run_mutations, mutations, file_entries, language_adapter, dependency_map, file_to_module,
@@ -171,13 +206,12 @@ defmodule Muex.WorkerPool do
     )
   end
 
-  # -- GenServer callbacks --
-
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
     max_workers = Keyword.get(opts, :max_workers, @default_max_workers)
 
+    # -- GenServer callbacks --
     state = %State{
       max_workers: max_workers,
       opts: opts
@@ -186,6 +220,7 @@ defmodule Muex.WorkerPool do
     {:ok, state}
   end
 
+  # Create sandboxes for parallel workers
   @impl true
   def handle_call(
         {:run_mutations, mutations, file_entries, language_adapter, dependency_map,
@@ -194,98 +229,119 @@ defmodule Muex.WorkerPool do
         state
       ) do
     if Enum.empty?(mutations) do
-      {:reply, [], state}
+      {:reply, {:ok, []}, state}
     else
-      # Create sandboxes for parallel workers
       test_paths = Keyword.get(opts, :test_paths, ["test"])
       project_root = Keyword.get(opts, :project_root, File.cwd!())
+      baseline_mutations = Keyword.get(opts, :baseline_mutations, mutations)
+
+      baseline_test_paths =
+        baseline_test_paths(baseline_mutations, test_paths, project_root, opts)
 
       sandboxes =
         Sandbox.create_pool(state.max_workers,
           project_root: project_root,
-          test_paths: test_paths
+          test_paths: baseline_test_paths
         )
 
-      available_sandboxes =
-        sandboxes
-        |> Enum.with_index()
-        |> Enum.reduce(:queue.new(), fn {_sb, idx}, q -> :queue.in(idx, q) end)
+      case prepare_and_baseline(sandboxes, mutations, baseline_test_paths, project_root, opts) do
+        :ok ->
+          available_sandboxes =
+            sandboxes
+            |> Enum.with_index()
+            |> Enum.reduce(:queue.new(), fn {_sb, idx}, q -> :queue.in(idx, q) end)
 
-      # Group mutations by file path into per-file queues
-      pending_by_file =
-        Enum.reduce(mutations, %{}, fn mutation, acc ->
-          file_path = mutation.location.file
-          queue = Map.get(acc, file_path, :queue.new())
-          Map.put(acc, file_path, :queue.in(mutation, queue))
-        end)
+          pending_by_file =
+            Enum.reduce(mutations, %{}, fn mutation, acc ->
+              file_path = mutation.location.file
+              queue = Map.get(acc, file_path, :queue.new())
+              Map.put(acc, file_path, :queue.in(mutation, queue))
+            end)
 
-      new_state = %{
-        state
-        | pending_by_file: pending_by_file,
-          file_entries: file_entries,
-          language_adapter: language_adapter,
-          dependency_map: dependency_map,
-          file_to_module: file_to_module,
-          project_root: project_root,
-          test_paths: test_paths,
-          opts: opts,
-          caller: from,
-          results: [],
-          total_mutations: length(mutations),
-          completed_mutations: 0,
-          locked_files: MapSet.new(),
-          active_workers: %{},
-          monitor_to_worker: %{},
-          sandboxes: sandboxes,
-          available_sandboxes: available_sandboxes
-      }
+          new_state = %{
+            state
+            | pending_by_file: pending_by_file,
+              file_entries: file_entries,
+              language_adapter: language_adapter,
+              dependency_map: dependency_map,
+              file_to_module: file_to_module,
+              project_root: project_root,
+              test_paths: test_paths,
+              baseline_test_paths: baseline_test_paths,
+              opts: opts,
+              caller: from,
+              results: [],
+              total_mutations: length(mutations),
+              completed_mutations: 0,
+              locked_files: MapSet.new(),
+              active_workers: %{},
+              monitor_to_worker: %{},
+              sandboxes: sandboxes,
+              available_sandboxes: available_sandboxes
+          }
 
-      {:noreply, schedule_workers(new_state)}
+          {:noreply, schedule_workers(new_state)}
+
+        {:error, reason} ->
+          Sandbox.cleanup(sandboxes)
+          {:reply, {:error, reason}, state}
+      end
     end
   end
 
   @impl true
   def handle_info({:worker_done, worker_ref, result}, state) do
-    # Use Map.pop instead of Map.fetch! — if :DOWN arrived first and
-    # already removed this worker, we ignore the duplicate completion.
-    case Map.pop(state.active_workers, worker_ref) do
-      {nil, _} ->
+    case Map.fetch(state.active_workers, worker_ref) do
+      :error ->
         {:noreply, state}
 
-      {{_mutation, file_path, sandbox_idx, monitor_ref}, new_active} ->
-        # Demonitor so we don't get a spurious :DOWN for normal exit
-        Process.demonitor(monitor_ref, [:flush])
-
-        new_monitor_map = Map.delete(state.monitor_to_worker, monitor_ref)
+      {:ok, {_mutation, file_path, sandbox_idx, pid, monitor_ref}} ->
         new_completed = state.completed_mutations + 1
 
-        # Print progress
-        if Keyword.get(state.opts, :verbose, false) do
-          try do
-            Reporter.print_progress(result, new_completed, state.total_mutations)
-          rescue
-            UndefinedFunctionError -> :ok
+        if result.result == :infrastructure_error do
+          _ =
+            Checkpoint.append_event(Keyword.get(state.opts, :checkpoint), %{
+              type: "infrastructure_error",
+              id: result.mutation.id,
+              error: inspect(result.error),
+              duration_ms: result.duration_ms
+            })
+
+          stop_with_error(
+            {:infrastructure_error, result.mutation.id, result.error},
+            state.active_workers,
+            state
+          )
+        else
+          case Checkpoint.append_result(Keyword.get(state.opts, :checkpoint), result) do
+            :ok ->
+              finish_worker(worker_ref, pid, monitor_ref)
+
+              if Keyword.get(state.opts, :verbose, false) do
+                try do
+                  Reporter.print_progress(result, new_completed, state.total_mutations)
+                rescue
+                  UndefinedFunctionError -> :ok
+                end
+              end
+
+              new_state = %{
+                state
+                | active_workers: Map.delete(state.active_workers, worker_ref),
+                  monitor_to_worker: Map.delete(state.monitor_to_worker, monitor_ref),
+                  results: [result | state.results],
+                  completed_mutations: new_completed,
+                  locked_files: MapSet.delete(state.locked_files, file_path),
+                  available_sandboxes: :queue.in(sandbox_idx, state.available_sandboxes),
+                  pending_by_file: cleanup_pending(state.pending_by_file, file_path)
+              }
+
+              maybe_finish_or_schedule(new_state)
+
+            {:error, reason} ->
+              stop_with_error({:checkpoint_write_failed, reason}, state.active_workers, state)
           end
         end
-
-        # Unlock the file and return the sandbox to the available pool
-        new_locked = MapSet.delete(state.locked_files, file_path)
-        new_available = :queue.in(sandbox_idx, state.available_sandboxes)
-
-        new_pending = cleanup_pending(state.pending_by_file, file_path)
-
-        new_state = %{
-          state
-          | active_workers: new_active,
-            monitor_to_worker: new_monitor_map,
-            results: [result | state.results],
-            completed_mutations: new_completed,
-            locked_files: new_locked,
-            available_sandboxes: new_available,
-            pending_by_file: new_pending
-        }
-
-        maybe_finish_or_schedule(new_state)
     end
   end
 
@@ -299,10 +355,10 @@ defmodule Muex.WorkerPool do
         {:noreply, %{state | monitor_to_worker: new_monitor_map}}
 
       {:ok, worker_ref} ->
-        {mutation, file_path, sandbox_idx, ^monitor_ref} =
+        {mutation, file_path, sandbox_idx, _pid, ^monitor_ref} =
           Map.fetch!(state.active_workers, worker_ref)
 
-        # Worker crashed — synthesize a failed result
+        # Worker crash is infrastructure failure; never dilute mutation score.
         Logger.warning("Mutation worker crashed: #{inspect(reason)}")
 
         # Best-effort restore of the sandbox before re-queueing it
@@ -314,39 +370,43 @@ defmodule Muex.WorkerPool do
           _ -> :ok
         end
 
-        result = %{
-          mutation: mutation,
-          result: :invalid,
-          duration_ms: 0,
-          error: {:worker_crashed, reason}
-        }
-
         new_active = Map.delete(state.active_workers, worker_ref)
         new_monitor_map = Map.delete(state.monitor_to_worker, monitor_ref)
-        new_completed = state.completed_mutations + 1
         new_locked = MapSet.delete(state.locked_files, file_path)
         new_available = :queue.in(sandbox_idx, state.available_sandboxes)
 
         new_pending = cleanup_pending(state.pending_by_file, file_path)
 
-        new_state = %{
-          state
-          | active_workers: new_active,
-            monitor_to_worker: new_monitor_map,
-            results: [result | state.results],
-            completed_mutations: new_completed,
-            locked_files: new_locked,
-            available_sandboxes: new_available,
-            pending_by_file: new_pending
-        }
+        _ = new_locked
+        _ = new_available
+        _ = new_pending
 
-        maybe_finish_or_schedule(new_state)
+        _ =
+          Checkpoint.append_event(Keyword.get(state.opts, :checkpoint), %{
+            type: "infrastructure_error",
+            id: mutation.id,
+            error: inspect({:worker_crashed, reason})
+          })
+
+        stop_with_error(
+          {:infrastructure_error, mutation.id, {:worker_crashed, reason}},
+          new_active,
+          %{
+            state
+            | monitor_to_worker: new_monitor_map
+          }
+        )
 
       :error ->
         # Worker already handled via :worker_done — ignore
         {:noreply, state}
     end
   end
+
+  @impl true
+  def handle_info({:EXIT, port, _reason}, state) when is_port(port), do: {:noreply, state}
+
+  def handle_info({:EXIT, pid, _reason}, state) when is_pid(pid), do: {:noreply, state}
 
   # -- Scheduling --
 
@@ -366,7 +426,9 @@ defmodule Muex.WorkerPool do
           worker_ref = make_ref()
 
           pid =
-            spawn(fn ->
+            spawn_link(fn ->
+              Process.flag(:trap_exit, true)
+
               result =
                 run_mutation_worker(
                   mutation,
@@ -375,7 +437,12 @@ defmodule Muex.WorkerPool do
                   state
                 )
 
+              Process.flag(:trap_exit, false)
               send(parent, {:worker_done, worker_ref, result})
+
+              receive do
+                {:worker_finished, ^worker_ref} -> :ok
+              end
             end)
 
           monitor_ref = Process.monitor(pid)
@@ -388,7 +455,7 @@ defmodule Muex.WorkerPool do
                 Map.put(
                   state.active_workers,
                   worker_ref,
-                  {mutation, file_path, sandbox_idx, monitor_ref}
+                  {mutation, file_path, sandbox_idx, pid, monitor_ref}
                 ),
               monitor_to_worker: Map.put(state.monitor_to_worker, monitor_ref, worker_ref),
               available_sandboxes: new_available
@@ -447,70 +514,294 @@ defmodule Muex.WorkerPool do
   defp maybe_finish_or_schedule(state) do
     if map_size(state.active_workers) == 0 and all_queues_empty?(state.pending_by_file) do
       Sandbox.cleanup(state.sandboxes)
-      GenServer.reply(state.caller, Enum.reverse(state.results))
+      GenServer.reply(state.caller, {:ok, Enum.reverse(state.results)})
       {:noreply, %{state | caller: nil}}
     else
       {:noreply, schedule_workers(state)}
     end
   end
 
-  # -- Worker execution --
-
   defp run_mutation_worker(mutation, file_path, sandbox, state) do
+    first = run_mutation_attempt(mutation, file_path, sandbox, state, 1)
+
+    case append_attempt_event(state, mutation.id, first, 1) do
+      :ok ->
+        if first.result in [:timeout, :infrastructure_error, :compile_failure] do
+          retry_mutation(first, mutation, file_path, sandbox, state)
+        else
+          first
+        end
+
+      {:error, reason} ->
+        audit_failure(first, reason)
+    end
+  end
+
+  defp retry_mutation(first, mutation, file_path, sandbox, state) do
+    case recover_sandbox(sandbox, state, mutation.id) do
+      {:ok, recovery} ->
+        record_recovery_and_retry(first, mutation, file_path, sandbox, state, recovery)
+
+      {:error, reason, recovery} ->
+        _ =
+          Muex.Audit.append_event(Keyword.get(state.opts, :audit_dir), mutation.id, %{
+            type: "recovery_failed",
+            recovery: recovery,
+            error: inspect(reason)
+          })
+
+        %{
+          first
+          | result: :infrastructure_error,
+            error: {:recovery_failed, reason},
+            audit: %{attempts: [first.audit], recovery: recovery}
+        }
+    end
+  end
+
+  defp record_recovery_and_retry(first, mutation, file_path, sandbox, state, recovery) do
+    case Muex.Audit.append_event(Keyword.get(state.opts, :audit_dir), mutation.id, %{
+           type: "recovery",
+           recovery: recovery
+         }) do
+      :ok ->
+        second = run_mutation_attempt(mutation, file_path, sandbox, state, 2)
+
+        case append_attempt_event(state, mutation.id, second, 2) do
+          :ok -> reconcile_attempts(first, second, recovery)
+          {:error, reason} -> audit_failure(second, reason)
+        end
+
+      {:error, reason} ->
+        audit_failure(first, reason)
+    end
+  end
+
+  defp append_attempt_event(state, mutant_id, result, attempt) do
+    Muex.Audit.append_event(Keyword.get(state.opts, :audit_dir), mutant_id, %{
+      type: "attempt",
+      attempt: attempt,
+      status: result.result,
+      duration_ms: result.duration_ms,
+      error: inspect(result.error),
+      timings: result.timings,
+      audit: result.audit
+    })
+  end
+
+  defp audit_failure(result, reason) do
+    %{result | result: :infrastructure_error, error: {:audit_write_failed, reason}}
+  end
+
+  defp run_mutation_attempt(mutation, file_path, sandbox, state, attempt) do
     timeout_ms = Keyword.get(state.opts, :timeout_ms, 5000)
     start_time = System.monotonic_time(:millisecond)
 
     file_entry = Map.fetch!(state.file_entries, file_path)
-    tce_enabled = Keyword.get(state.opts, :tce, true)
 
-    result =
+    {result_type, error, timings, audit} =
       case select_tests(mutation, state) do
         # Coverage-guided: no test exercises this line, so nothing can kill it.
         :no_coverage ->
-          :no_coverage
+          {:no_coverage, nil, %{}, %{classification: :no_coverage}}
 
         {:run, test_files} ->
           case Compiler.compile_to_source(mutation, file_entry, state.language_adapter) do
             {:ok, mutated_source} ->
-              if tce_enabled and Tce.equivalent_source?(file_entry.ast, mutated_source) do
-                # Provably equivalent: no test can ever kill it, so skip the
-                # (expensive) `mix test` subprocess entirely.
-                :equivalent
-              else
-                run_in_sandbox(
-                  sandbox,
-                  file_path,
-                  mutated_source,
-                  file_entry,
-                  test_files,
-                  timeout_ms
-                )
+              case state.language_adapter.unparse(file_entry.ast) do
+                {:ok, original_source} ->
+                  if mutated_source == original_source do
+                    {:no_op, :identical_source, %{},
+                     %{classification: :no_op, reason: :identical_source}}
+                  else
+                    run_in_sandbox(
+                      sandbox,
+                      file_path,
+                      mutated_source,
+                      file_entry,
+                      test_files,
+                      %{
+                        timeout_ms: timeout_ms,
+                        audit_dir: Keyword.get(state.opts, :audit_dir),
+                        mutant_id: mutation.id,
+                        attempt: attempt
+                      }
+                    )
+                  end
+
+                {:error, reason} ->
+                  {:infrastructure_error, {:original_source_unparse_failed, reason}, %{}, nil}
               end
 
             {:error, reason} ->
-              {:invalid, reason}
+              {:infrastructure_error, {:mutation_source_generation_failed, reason}, %{}, nil}
           end
       end
 
     duration_ms = System.monotonic_time(:millisecond) - start_time
 
-    {result_type, error} =
-      case result do
-        {:invalid, err} -> {:invalid, err}
-        other -> {other, nil}
-      end
-
-    %{mutation: mutation, result: result_type, duration_ms: duration_ms, error: error}
+    %{
+      mutation: mutation,
+      result: result_type,
+      duration_ms: duration_ms,
+      error: error,
+      timings: timings,
+      audit: audit
+    }
   rescue
-    e -> %{mutation: mutation, result: :timeout, duration_ms: 0, error: e}
+    e ->
+      %{
+        mutation: mutation,
+        result: :infrastructure_error,
+        duration_ms: 0,
+        error: e,
+        timings: %{},
+        audit: nil
+      }
   catch
-    :exit, reason -> %{mutation: mutation, result: :timeout, duration_ms: 0, error: reason}
+    :exit, reason ->
+      %{
+        mutation: mutation,
+        result: :infrastructure_error,
+        duration_ms: 0,
+        error: reason,
+        timings: %{},
+        audit: nil
+      }
+  end
+
+  defp reconcile_attempts(%{result: :timeout} = first, %{result: :timeout} = second, recovery) do
+    %{second | audit: %{attempts: [first.audit, second.audit], recovery: recovery}}
+  end
+
+  defp reconcile_attempts(
+         %{result: :compile_failure} = first,
+         %{result: :compile_failure} = second,
+         recovery
+       ) do
+    %{
+      second
+      | result: :invalid,
+        audit: %{attempts: [first.audit, second.audit], recovery: recovery}
+    }
+  end
+
+  defp reconcile_attempts(
+         %{result: :infrastructure_error, error: first_error} = first,
+         %{result: :infrastructure_error, error: second_error} = second,
+         recovery
+       ) do
+    case repeatable_test_process_failure(first_error, second_error) do
+      {:ok, failure} ->
+        %{
+          second
+          | result: :killed,
+            error: nil,
+            audit: %{
+              classification: :reproduced_pre_exunit_failure,
+              test_process_failure: failure,
+              attempts: [first.audit, second.audit],
+              recovery: recovery
+            }
+        }
+
+      :error ->
+        %{
+          second
+          | error: {:divergent_attempts, first.result, second.result},
+            audit: %{attempts: [first.audit, second.audit], recovery: recovery}
+        }
+    end
+  end
+
+  defp reconcile_attempts(first, second, recovery) do
+    %{
+      second
+      | result: :infrastructure_error,
+        error: {:divergent_attempts, first.result, second.result},
+        audit: %{attempts: [first.audit, second.audit], recovery: recovery}
+    }
+  end
+
+  defp repeatable_test_process_failure(
+         {:test_process_failed, exit_code, _first_output, %{bytes: bytes, sha256: sha256}},
+         {:test_process_failed, exit_code, _second_output, %{bytes: bytes, sha256: sha256}}
+       )
+       when is_integer(exit_code) and exit_code > 0 and is_integer(bytes) and bytes >= 0 and
+              is_binary(sha256),
+       do: {:ok, %{exit_code: exit_code, bytes: bytes, sha256: sha256}}
+
+  defp repeatable_test_process_failure(_first, _second), do: :error
+
+  defp recover_sandbox(sandbox, state, mutant_id) do
+    timeout_ms = Keyword.get(state.opts, :baseline_timeout_ms, 120_000)
+    audit_dir = Keyword.get(state.opts, :audit_dir)
+    files = Map.keys(state.file_entries)
+    tests = relativize_paths(state.baseline_test_paths, state.project_root)
+
+    with {:ok, _rebuilt} <- Sandbox.rebuild(sandbox, files, state.baseline_test_paths),
+         {:ok, compile} <-
+           PortRunner.run_compile(
+             timeout_ms: timeout_ms,
+             cd: sandbox.root,
+             output_file: output_path(audit_dir, mutant_id, "recovery", "compile")
+           ) do
+      compile_audit = audit_process_result({:ok, compile})
+      first = run_recovery_tests(sandbox, tests, timeout_ms, audit_dir, mutant_id, 1)
+
+      case first do
+        {:ok, test_audit} ->
+          {:ok, recovery_audit(compile_audit, [test_audit])}
+
+        {:error, :baseline_test_failures, test_audit} ->
+          second = run_recovery_tests(sandbox, tests, timeout_ms, audit_dir, mutant_id, 2)
+
+          case second do
+            {:ok, second_audit} ->
+              {:ok, recovery_audit(compile_audit, [test_audit, second_audit])}
+
+            {:error, reason, second_audit} ->
+              {:error, reason, recovery_audit(compile_audit, [test_audit, second_audit])}
+          end
+
+        {:error, reason, test_audit} ->
+          {:error, reason, recovery_audit(compile_audit, [test_audit])}
+      end
+    else
+      {:error, reason} -> {:error, reason, %{rebuilt: true}}
+    end
+  end
+
+  defp run_recovery_tests(sandbox, tests, timeout_ms, audit_dir, mutant_id, attempt) do
+    result =
+      PortRunner.run_tests(tests,
+        timeout_ms: timeout_ms,
+        cd: sandbox.root,
+        no_compile: true,
+        output_file: output_path(audit_dir, mutant_id, "recovery-#{attempt}", "test")
+      )
+
+    audit = %{attempt: attempt, test: audit_process_result(result)}
+
+    case result do
+      {:ok, %{failures: 0}} -> {:ok, audit}
+      {:ok, _test} -> {:error, :baseline_test_failures, audit}
+      {:error, reason} -> {:error, reason, audit}
+    end
+  end
+
+  defp recovery_audit(compile, test_attempts) do
+    %{
+      rebuilt: true,
+      baseline: %{compile: compile, test: test_attempts |> List.last() |> Map.fetch!(:test)},
+      test_attempts: test_attempts
+    }
   end
 
   # Picks the test files to run for a mutation. With coverage guidance, runs
-  # only the tests that execute the mutated line (or :no_coverage if none);
-  # otherwise falls back to module-level dependency analysis, then to the full
-  # test set. Paths are made project-root-relative for `mix test` in the sandbox.
+  # only the tests that execute the mutated line (or :no_coverage if none).
+  # Without runtime coverage evidence, runs the full declared test corpus.
+  # Paths are made project-root-relative for `mix test` in the sandbox.
   defp select_tests(mutation, state) do
     case Keyword.get(state.opts, :coverage_index) do
       nil ->
@@ -526,47 +817,232 @@ defmodule Muex.WorkerPool do
             {:run, relativize_paths(tests, state.project_root)}
 
           # No coverage data for the line (e.g. a non-executable def/module
-          # header, or a mutator that reported line 0): we can't decide, so run
-          # it the default way rather than skip a possibly-killable mutant.
+          # header, or a macro-expanded expression): use every test known to
+          # execute the source file. With no such evidence, keep the full corpus
+          # rather than skip a possibly-killable mutant.
           :unknown ->
-            default_selection(mutation, state)
+            case Coverage.tests_for_file(index, mutation.location.file) do
+              [] -> default_selection(mutation, state)
+              tests -> {:run, relativize_paths(tests, state.project_root)}
+            end
         end
     end
   end
 
-  defp default_selection(mutation, state) do
-    mutation
-    |> DependencyAnalyzer.get_tests_for_mutation(state.dependency_map, state.file_to_module)
-    |> fallback_to_all(state.test_paths)
+  defp default_selection(_mutation, state) do
+    state.test_paths
+    |> Config.expand_test_paths()
     |> relativize_paths(state.project_root)
     |> then(&{:run, &1})
   end
 
-  defp fallback_to_all([], test_paths), do: Config.expand_test_paths(test_paths)
-  defp fallback_to_all(test_files, _test_paths), do: test_files
+  defp baseline_test_paths(mutations, test_paths, project_root, opts) do
+    full_corpus = Config.expand_test_paths(test_paths)
 
-  defp run_in_sandbox(sandbox, file_path, mutated_source, file_entry, test_files, timeout_ms) do
-    case Sandbox.apply_mutation(sandbox, file_path, mutated_source, file_entry.module_name) do
-      {:ok, _precompiled} ->
-        # Wrap in try/after so the sandbox is always restored, even if
-        # PortRunner.run_tests raises an exception.
-        try do
-          test_files
-          |> PortRunner.run_tests(timeout_ms: timeout_ms, cd: sandbox.root)
-          |> classify_test_result()
-        after
-          Sandbox.restore(sandbox, file_path)
+    case Keyword.get(opts, :coverage_index) do
+      nil ->
+        full_corpus
+
+      index ->
+        mutations
+        |> Enum.reduce_while(MapSet.new(), fn mutation, selected ->
+          case tests_for_baseline(mutation, index) do
+            :full_corpus ->
+              {:halt, :full_corpus}
+
+            tests ->
+              {:cont,
+               Enum.reduce(tests, selected, &MapSet.put(&2, Path.expand(&1, project_root)))}
+          end
+        end)
+        |> case do
+          :full_corpus -> full_corpus
+          selected -> selected |> MapSet.to_list() |> Enum.sort()
         end
-
-      {:error, reason} ->
-        {:invalid, reason}
     end
   end
 
-  defp classify_test_result({:ok, %{failures: 0}}), do: :survived
-  defp classify_test_result({:ok, %{failures: _}}), do: :killed
-  defp classify_test_result({:error, :timeout}), do: :timeout
-  defp classify_test_result({:error, reason}), do: {:invalid, reason}
+  defp tests_for_baseline(mutation, index) do
+    case Coverage.tests_for(index, mutation.location.file, mutation.location.line) do
+      {:covered, tests} ->
+        tests
+
+      :no_coverage ->
+        []
+
+      :unknown ->
+        case Coverage.tests_for_file(index, mutation.location.file) do
+          [] -> :full_corpus
+          tests -> tests
+        end
+    end
+  end
+
+  defp run_in_sandbox(
+         sandbox,
+         file_path,
+         mutated_source,
+         file_entry,
+         test_files,
+         context
+       ) do
+    %{timeout_ms: timeout_ms, audit_dir: audit_dir, mutant_id: mutant_id, attempt: attempt} =
+      context
+
+    apply_started = System.monotonic_time(:millisecond)
+
+    case Sandbox.apply_mutation(sandbox, file_path, mutated_source, file_entry.module_name) do
+      {:ok, _precompiled} ->
+        apply_ms = System.monotonic_time(:millisecond) - apply_started
+
+        compile_output = output_path(audit_dir, mutant_id, attempt, "compile")
+        test_output = output_path(audit_dir, mutant_id, attempt, "test")
+
+        {result, error, compile_ms, test_ms, audit} =
+          try do
+            compile_started = System.monotonic_time(:millisecond)
+
+            compile_result =
+              PortRunner.run_compile(
+                timeout_ms: timeout_ms,
+                cd: sandbox.root,
+                output_file: compile_output
+              )
+
+            measured_compile_ms = System.monotonic_time(:millisecond) - compile_started
+
+            case compile_result do
+              {:ok, compile} ->
+                test_started = System.monotonic_time(:millisecond)
+
+                test_result =
+                  PortRunner.run_tests(test_files,
+                    timeout_ms: timeout_ms,
+                    cd: sandbox.root,
+                    no_compile: true,
+                    output_file: test_output
+                  )
+
+                measured_test_ms = System.monotonic_time(:millisecond) - test_started
+                {status, test_error, _reported_test_ms} = classify_test_result(test_result)
+
+                {status, test_error, compile.duration_ms, measured_test_ms,
+                 audit_attempt(attempt, test_files, compile_result, test_result)}
+
+              {:error, reason} ->
+                {status, error, _duration} = classify_test_result({:error, reason})
+
+                {status, error, measured_compile_ms, 0,
+                 audit_attempt(attempt, test_files, compile_result, nil)}
+            end
+          rescue
+            error ->
+              {:infrastructure_error, error, 0, 0, %{attempt: attempt, exception: inspect(error)}}
+          end
+
+        cleanup_started = System.monotonic_time(:millisecond)
+        Sandbox.restore(sandbox, file_path)
+        cleanup_ms = System.monotonic_time(:millisecond) - cleanup_started
+
+        {result, error,
+         %{apply_ms: apply_ms, compile_ms: compile_ms, test_ms: test_ms, cleanup_ms: cleanup_ms},
+         audit}
+
+      {:error, reason} ->
+        {:infrastructure_error, reason,
+         %{apply_ms: System.monotonic_time(:millisecond) - apply_started}, nil}
+    end
+  end
+
+  defp classify_test_result({:ok, %{failures: 0, duration_ms: duration}}),
+    do: {:survived, nil, duration}
+
+  defp classify_test_result({:ok, %{failures: _, duration_ms: duration}}),
+    do: {:killed, nil, duration}
+
+  defp classify_test_result({:error, {:timeout, output}}), do: {:timeout, {:timeout, output}, 0}
+
+  defp classify_test_result({:error, {:timeout, output, artifact}}),
+    do: {:timeout, {:timeout, output, artifact}, 0}
+
+  defp classify_test_result({:error, {:compile_error, _, _, _} = reason}),
+    do: {:compile_failure, reason, 0}
+
+  defp classify_test_result({:error, {:compile_error, _, _} = reason}),
+    do: {:compile_failure, reason, 0}
+
+  defp classify_test_result({:error, {:compile_error, _} = reason}),
+    do: {:compile_failure, reason, 0}
+
+  defp classify_test_result({:error, reason}), do: {:infrastructure_error, reason, 0}
+
+  defp output_path(nil, _id, _attempt, _kind), do: nil
+
+  defp output_path(directory, id, attempt, kind) do
+    Path.join([directory, "outputs", "#{id}.attempt-#{attempt}.#{kind}.log"])
+  end
+
+  defp audit_attempt(attempt, tests, compile_result, test_result) do
+    %{
+      attempt: attempt,
+      tests: tests,
+      commands: [
+        ["mix", "compile", "--no-deps-check", "--no-archives-check"],
+        [
+          "mix",
+          "test",
+          "--max-failures",
+          "1",
+          "--formatter",
+          "Muex.ExUnitFormatter",
+          "--no-compile",
+          "--no-deps-check",
+          "--no-archives-check"
+          | tests
+        ]
+      ],
+      compile: audit_process_result(compile_result),
+      test: audit_process_result(test_result)
+    }
+  end
+
+  defp audit_process_result(nil), do: nil
+
+  defp audit_process_result({:ok, result}) do
+    Map.take(result, [:exit_code, :duration_ms, :failures, :tests, :output_artifact])
+  end
+
+  defp audit_process_result({:error, {:test_process_failed, exit_code, _output} = reason}) do
+    %{
+      error: inspect(reason),
+      failure: :test_process_failed,
+      exit_code: exit_code,
+      output_artifact: tuple_artifact(reason)
+    }
+  end
+
+  defp audit_process_result(
+         {:error, {:test_process_failed, exit_code, _output, _artifact} = reason}
+       ) do
+    %{
+      error: inspect(reason),
+      failure: :test_process_failed,
+      exit_code: exit_code,
+      output_artifact: tuple_artifact(reason)
+    }
+  end
+
+  defp audit_process_result({:error, reason}),
+    do: %{error: inspect(reason), output_artifact: tuple_artifact(reason)}
+
+  defp tuple_artifact(tuple) when is_tuple(tuple) do
+    case tuple |> Tuple.to_list() |> List.last() do
+      %{path: _path, bytes: _bytes, sha256: _sha256} = artifact -> artifact
+      _ -> nil
+    end
+  end
+
+  defp tuple_artifact(_other), do: nil
 
   # Convert absolute test file paths to relative so `mix test` (running in
   # the sandbox, which mirrors the project root) can resolve them.
@@ -574,12 +1050,228 @@ defmodule Muex.WorkerPool do
     Enum.map(paths, &Path.relative_to(&1, project_root))
   end
 
+  defp prepare_and_baseline(sandboxes, mutations, test_paths, project_root, opts) do
+    files = Enum.map(mutations, & &1.location.file)
+    tests = test_paths |> Config.expand_test_paths() |> relativize_paths(project_root)
+    timeout_ms = Keyword.get(opts, :baseline_timeout_ms, 120_000)
+    checkpoint = Keyword.get(opts, :checkpoint)
+    audit_dir = Keyword.get(opts, :audit_dir)
+
+    sandboxes
+    |> Enum.with_index(1)
+    |> Enum.reduce_while(:ok, fn {sandbox, index}, :ok ->
+      context = %{
+        files: files,
+        test_paths: test_paths,
+        tests: tests,
+        timeout_ms: timeout_ms,
+        audit_dir: audit_dir,
+        index: index
+      }
+
+      baseline_sandbox(sandbox, checkpoint, context)
+    end)
+  end
+
+  defp baseline_sandbox(sandbox, checkpoint, context) do
+    first =
+      run_baseline_attempt(sandbox, Map.merge(context, %{attempt: 1, preparation: :prepare}))
+
+    case Checkpoint.append_baseline(checkpoint, context.index, context.tests, 1, first) do
+      :ok ->
+        case first do
+          {:ok, _} -> {:cont, :ok}
+          {:error, _reason, _audit} -> retry_baseline(sandbox, checkpoint, context)
+        end
+
+      {:error, reason} ->
+        {:halt, {:error, {:checkpoint_write_failed, reason}}}
+    end
+  end
+
+  defp retry_baseline(sandbox, checkpoint, context) do
+    second =
+      run_baseline_attempt(sandbox, Map.merge(context, %{attempt: 2, preparation: :rebuild}))
+
+    case Checkpoint.append_baseline(checkpoint, context.index, context.tests, 2, second) do
+      :ok ->
+        case second do
+          {:ok, _} -> {:cont, :ok}
+          {:error, reason, _audit} -> {:halt, {:error, {:baseline_failed, context.index, reason}}}
+        end
+
+      {:error, reason} ->
+        {:halt, {:error, {:checkpoint_write_failed, reason}}}
+    end
+  end
+
+  defp run_baseline_attempt(sandbox, context) do
+    %{
+      files: files,
+      test_paths: test_paths,
+      tests: tests,
+      timeout_ms: timeout_ms,
+      audit_dir: audit_dir,
+      index: index,
+      attempt: attempt,
+      preparation: preparation
+    } = context
+
+    prepared =
+      case preparation do
+        :prepare ->
+          Sandbox.prepare(sandbox, files)
+
+        :rebuild ->
+          case Sandbox.rebuild(sandbox, files, test_paths) do
+            {:ok, _rebuilt} -> :ok
+            {:error, _reason} = error -> error
+          end
+      end
+
+    case prepared do
+      :ok ->
+        compile =
+          PortRunner.run_compile(
+            timeout_ms: timeout_ms,
+            cd: sandbox.root,
+            output_file: output_path(audit_dir, "baseline-#{index}", attempt, "compile")
+          )
+
+        case compile do
+          {:ok, compile_result} ->
+            run_baseline_tests(
+              sandbox,
+              tests,
+              timeout_ms,
+              audit_dir,
+              index,
+              attempt,
+              compile,
+              compile_result
+            )
+
+          {:error, reason} ->
+            {:error, reason, %{compile: audit_process_result(compile), test: nil}}
+        end
+
+      {:error, reason} ->
+        {:error, reason, %{compile: nil, test: nil}}
+    end
+  end
+
+  defp run_baseline_tests(
+         _sandbox,
+         [],
+         _timeout_ms,
+         _audit_dir,
+         _index,
+         _attempt,
+         _compile,
+         compile_result
+       ),
+       do: {:ok, %{compile: compile_result, test: nil}}
+
+  defp run_baseline_tests(
+         sandbox,
+         tests,
+         timeout_ms,
+         audit_dir,
+         index,
+         attempt,
+         compile,
+         compile_result
+       ) do
+    test =
+      PortRunner.run_tests(tests,
+        timeout_ms: timeout_ms,
+        cd: sandbox.root,
+        no_compile: true,
+        output_file: output_path(audit_dir, "baseline-#{index}", attempt, "test")
+      )
+
+    case test do
+      {:ok, %{failures: 0} = test_result} ->
+        {:ok, %{compile: compile_result, test: test_result}}
+
+      {:ok, test_result} ->
+        {:error, :test_failures,
+         %{compile: audit_process_result(compile), test: audit_process_result({:ok, test_result})}}
+
+      {:error, reason} ->
+        {:error, reason,
+         %{compile: audit_process_result(compile), test: audit_process_result(test)}}
+    end
+  end
+
+  defp stop_with_error(reason, active_workers, state) do
+    shutdown_workers(active_workers)
+    Sandbox.cleanup(state.sandboxes)
+    GenServer.reply(state.caller, {:error, reason})
+
+    {:noreply,
+     %{
+       state
+       | caller: nil,
+         active_workers: %{},
+         monitor_to_worker: %{},
+         sandboxes: [],
+         pending_by_file: %{}
+     }}
+  end
+
   @impl true
   def terminate(_reason, state) do
+    shutdown_workers(state.active_workers)
+
     if state.sandboxes != [] do
       Sandbox.cleanup(state.sandboxes)
     end
 
     :ok
+  end
+
+  defp finish_worker(worker_ref, pid, monitor_ref) do
+    send(pid, {:worker_finished, worker_ref})
+    deadline = System.monotonic_time(:millisecond) + @worker_shutdown_timeout_ms
+    await_workers(%{monitor_ref => pid}, deadline)
+  end
+
+  defp shutdown_workers(active_workers) when map_size(active_workers) == 0, do: :ok
+
+  defp shutdown_workers(active_workers) do
+    workers =
+      Map.new(active_workers, fn {_worker_ref, {_mutation, _file, _sandbox, pid, monitor_ref}} ->
+        {monitor_ref, pid}
+      end)
+
+    Enum.each(workers, fn {_monitor_ref, pid} -> Process.exit(pid, :shutdown) end)
+
+    deadline = System.monotonic_time(:millisecond) + @worker_shutdown_timeout_ms
+    await_workers(workers, deadline)
+  end
+
+  defp await_workers(workers, _deadline) when map_size(workers) == 0, do: :ok
+
+  defp await_workers(workers, deadline) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:DOWN, monitor_ref, :process, _pid, _reason} when is_map_key(workers, monitor_ref) ->
+        await_workers(Map.delete(workers, monitor_ref), deadline)
+    after
+      remaining_ms ->
+        Enum.each(workers, fn {_monitor_ref, pid} -> Process.exit(pid, :kill) end)
+        await_killed_workers(workers)
+    end
+  end
+
+  defp await_killed_workers(workers) when map_size(workers) == 0, do: :ok
+
+  defp await_killed_workers(workers) do
+    receive do
+      {:DOWN, monitor_ref, :process, _pid, _reason} when is_map_key(workers, monitor_ref) ->
+        await_killed_workers(Map.delete(workers, monitor_ref))
+    end
   end
 end

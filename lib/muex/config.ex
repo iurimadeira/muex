@@ -54,8 +54,8 @@ defmodule Muex.Config do
     * `--no-filter` - Disable intelligent file filtering
     * `--verbose` - Show detailed progress information
     * `--optimize` / `--no-optimize` - Enable/disable mutation optimization (default: enabled)
-    * `--tce` / `--no-tce` - Enable/disable Trivial Compiler Equivalence, which
-      drops mutants that compile to identical BEAM code (default: enabled)
+    * `--tce` - Rejected because compiler-equivalence detection is not sound.
+      `--no-tce` is accepted for compatibility and is always the effective mode.
     * `--since` - Only test mutations on lines changed since the given git ref
       (e.g. `--since main`), using `git diff <ref>...HEAD` (PR semantics)
     * `--coverage-guided` - Run only the tests that cover each mutated line, and
@@ -65,7 +65,29 @@ defmodule Muex.Config do
     * `--max-per-function` - Override maximum mutations per function for optimizer
     * `--keep-metadata-mutations` - Keep mutations that have no usable source
       location (reported at `line: 0`). These are typically compile-time
-      metadata; they are dropped by default to keep reports actionable.
+      metadata; they remain in the audit plan as `excluded_unlocatable` unless kept.
+    * `--checkpoint` - Append terminal results to a resumable JSONL checkpoint
+    * `--report-file` - Atomically write JSON output to this exact path
+    * `--audit-dir` - Store the complete plan, append-only events, and process outputs
+    * `--baseline-timeout` - Separate per-sandbox baseline timeout in milliseconds
+    * `--mutant-id` - Select exactly one stable mutation ID
+    * `--mutant-ids-file` - Newline-delimited file of stable mutation IDs to run;
+      the shard-scoped form of `--mutant-id`
+    * `--campaign-fingerprint` - Bind checkpoint evidence to an outer campaign
+    * `--inventory-cache-file` / `--inventory-cache-key` - Reuse a
+      campaign-owned, content-addressed mutation inventory and audited plan;
+      both are required together, they require `--audit-dir`, and the key must
+      be a lowercase 64-character SHA-256 digest
+    * `--project-root` - Anchor for every relative path (default: derived from
+      `--files`)
+    * `--audit-only` / `--audit-plan` - Publish the optimized inventory to the
+      given exact path without running any test or mutant
+    * `--coverage-index-file` / `--coverage-corpus-fingerprint` - Consume a
+      campaign-owned coverage index instead of measuring coverage in-process;
+      the index requires `--coverage-guided` and the fingerprint requires the
+      index
+    * `--changed-diff-file` - Supply the `--since` diff as a file instead of
+      shelling out to git
     * `--preset` - Framework preset that prunes noisy DSL calls: `phoenix`,
       `ecto`, `ash`, or `none` (default: `none`).
 
@@ -87,11 +109,15 @@ defmodule Muex.Config do
   `--mutators` explicitly always overrides this default.
   """
 
+  alias Muex.Config.Internal
+  alias Muex.Language.Elixir, as: ElixirLanguage
+
   @type t :: %__MODULE__{
           files: [String.t()],
           test_paths: [String.t()],
           app: String.t() | nil,
           project_root: Path.t(),
+          internal: Internal.t(),
           language: module(),
           mutators: [module()],
           concurrency: pos_integer(),
@@ -111,14 +137,21 @@ defmodule Muex.Config do
           max_per_function: pos_integer() | nil,
           keep_metadata: boolean(),
           preset: String.t(),
-          skip_calls: [atom()]
+          skip_calls: [atom()],
+          report_file: Path.t() | nil,
+          audit_dir: Path.t() | nil,
+          baseline_timeout_ms: pos_integer(),
+          mutant_id: String.t() | nil,
+          mutant_ids_file: Path.t() | nil,
+          campaign_fingerprint: String.t() | nil
         }
-  @enforce_keys [:files, :test_paths, :project_root, :language, :mutators]
+  @enforce_keys [:files, :test_paths, :project_root, :internal, :language, :mutators]
   defstruct [
     :files,
     :test_paths,
     :app,
     :project_root,
+    :internal,
     :language,
     :mutators,
     concurrency: 4,
@@ -130,7 +163,7 @@ defmodule Muex.Config do
     filter: true,
     verbose: false,
     optimize: true,
-    tce: true,
+    tce: false,
     since: nil,
     coverage_guided: false,
     optimize_level: "balanced",
@@ -138,7 +171,13 @@ defmodule Muex.Config do
     max_per_function: nil,
     keep_metadata: false,
     preset: "none",
-    skip_calls: []
+    skip_calls: [],
+    report_file: nil,
+    audit_dir: nil,
+    baseline_timeout_ms: 120_000,
+    mutant_id: nil,
+    mutant_ids_file: nil,
+    campaign_fingerprint: nil
   ]
 
   @option_spec files: :string,
@@ -162,11 +201,25 @@ defmodule Muex.Config do
                tce: :boolean,
                no_tce: :boolean,
                since: :string,
+               changed_diff_file: :string,
                coverage_guided: :boolean,
+               coverage_index_file: :string,
+               coverage_corpus_fingerprint: :string,
                optimize_level: :string,
                min_complexity: :integer,
                max_per_function: :integer,
                keep_metadata_mutations: :boolean,
+               checkpoint: :string,
+               report_file: :string,
+               audit_dir: :string,
+               audit_only: :boolean,
+               audit_plan: :string,
+               baseline_timeout: :integer,
+               mutant_id: :string,
+               mutant_ids_file: :string,
+               campaign_fingerprint: :string,
+               inventory_cache_file: :string,
+               inventory_cache_key: :string,
                preset: :string
   @doc "Parses a list of CLI argument strings into a `%Config{}`.\n\nReturns `{:ok, config}` or `{:error, reason}`.\n"
   @spec from_args([String.t()]) :: {:ok, t()} | {:error, String.t()}
@@ -194,12 +247,30 @@ defmodule Muex.Config do
          {:ok, mutators} <-
            resolve_mutators(Keyword.get(opts, :mutators), extra_paths, language, preset),
          {:ok, optimize_level} <-
-           validate_optimize_level(Keyword.get(opts, :optimize_level, "balanced")) do
+           validate_optimize_level(Keyword.get(opts, :optimize_level, "balanced")),
+         :ok <- validate_positive(opts, :concurrency),
+         :ok <- validate_positive(opts, :timeout),
+         :ok <- validate_positive(opts, :baseline_timeout),
+         :ok <- validate_coverage_index(opts),
+         :ok <- validate_inventory_cache(opts),
+         :ok <- validate_audit_only(opts),
+         :ok <- validate_mutant_selection(opts),
+         :ok <- validate_tce_disabled(opts) do
       config = %__MODULE__{
         files: files,
         test_paths: resolve_test_paths(opts, app),
         app: app,
         project_root: project_root,
+        internal: %Internal{
+          audit_only: Keyword.get(opts, :audit_only, false),
+          audit_plan: Keyword.get(opts, :audit_plan),
+          changed_diff_file: Keyword.get(opts, :changed_diff_file),
+          checkpoint: Keyword.get(opts, :checkpoint),
+          coverage_index_file: Keyword.get(opts, :coverage_index_file),
+          coverage_corpus_fingerprint: Keyword.get(opts, :coverage_corpus_fingerprint),
+          inventory_cache_file: Keyword.get(opts, :inventory_cache_file),
+          inventory_cache_key: Keyword.get(opts, :inventory_cache_key)
+        },
         language: language,
         mutators: mutators,
         concurrency: Keyword.get(opts, :concurrency, System.schedulers_online()),
@@ -211,7 +282,7 @@ defmodule Muex.Config do
         filter: not Keyword.get(opts, :no_filter, false),
         verbose: Keyword.get(opts, :verbose, false),
         optimize: resolve_optimize(opts),
-        tce: resolve_tce(opts),
+        tce: false,
         since: Keyword.get(opts, :since),
         coverage_guided: Keyword.get(opts, :coverage_guided, false),
         optimize_level: optimize_level,
@@ -219,10 +290,93 @@ defmodule Muex.Config do
         max_per_function: Keyword.get(opts, :max_per_function),
         keep_metadata: Keyword.get(opts, :keep_metadata_mutations, false),
         preset: preset,
-        skip_calls: preset_skip_calls(preset)
+        skip_calls: preset_skip_calls(preset),
+        report_file: Keyword.get(opts, :report_file),
+        audit_dir: Keyword.get(opts, :audit_dir),
+        baseline_timeout_ms: Keyword.get(opts, :baseline_timeout, 120_000),
+        mutant_id: Keyword.get(opts, :mutant_id),
+        mutant_ids_file: Keyword.get(opts, :mutant_ids_file),
+        campaign_fingerprint: Keyword.get(opts, :campaign_fingerprint)
       }
 
       {:ok, config}
+    end
+  end
+
+  defp validate_mutant_selection(opts) do
+    if Keyword.has_key?(opts, :mutant_id) and Keyword.has_key?(opts, :mutant_ids_file),
+      do: {:error, "--mutant-id and --mutant-ids-file are mutually exclusive"},
+      else: :ok
+  end
+
+  defp validate_audit_only(opts) do
+    audit_only? = Keyword.get(opts, :audit_only, false)
+    audit_plan = Keyword.get(opts, :audit_plan)
+
+    cond do
+      audit_only? and (not is_binary(audit_plan) or audit_plan == "") ->
+        {:error, "--audit-only requires --audit-plan"}
+
+      is_binary(audit_plan) and not audit_only? ->
+        {:error, "--audit-plan requires --audit-only"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_coverage_index(opts) do
+    index? = Keyword.has_key?(opts, :coverage_index_file)
+    fingerprint = Keyword.get(opts, :coverage_corpus_fingerprint)
+
+    cond do
+      index? and not Keyword.get(opts, :coverage_guided, false) ->
+        {:error, "--coverage-index-file requires --coverage-guided"}
+
+      is_binary(fingerprint) and not index? ->
+        {:error, "--coverage-corpus-fingerprint requires --coverage-index-file"}
+
+      is_binary(fingerprint) and not Regex.match?(~r/\A[a-f0-9]{64}\z/, fingerprint) ->
+        {:error, "--coverage-corpus-fingerprint must be a lowercase SHA-256 digest"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_inventory_cache(opts) do
+    file = Keyword.get(opts, :inventory_cache_file)
+    key = Keyword.get(opts, :inventory_cache_key)
+
+    cond do
+      is_nil(file) and is_nil(key) ->
+        :ok
+
+      is_nil(file) or is_nil(key) ->
+        {:error, "--inventory-cache-file and --inventory-cache-key must be provided together"}
+
+      is_nil(Keyword.get(opts, :audit_dir)) ->
+        {:error, "--inventory-cache-file requires --audit-dir"}
+
+      not Regex.match?(~r/\A[a-f0-9]{64}\z/, key) ->
+        {:error, "--inventory-cache-key must be a lowercase SHA-256 digest"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_positive(opts, key) do
+    case Keyword.fetch(opts, key) do
+      :error ->
+        :ok
+
+      {:ok, value} when is_integer(value) and value > 0 ->
+        :ok
+
+      {:ok, _value} ->
+        {:error,
+         "--#{key |> Atom.to_string() |> String.replace("_", "-")} must be a positive integer"}
     end
   end
 
@@ -236,7 +390,6 @@ defmodule Muex.Config do
             enabled: true,
             min_complexity: 1,
             max_mutations_per_function: 50,
-            cluster_similarity_threshold: 0.8,
             keep_boundary_mutations: true
           ]
 
@@ -245,7 +398,6 @@ defmodule Muex.Config do
             enabled: true,
             min_complexity: 2,
             max_mutations_per_function: 20,
-            cluster_similarity_threshold: 0.8,
             keep_boundary_mutations: true
           ]
 
@@ -254,7 +406,6 @@ defmodule Muex.Config do
             enabled: true,
             min_complexity: 3,
             max_mutations_per_function: 10,
-            cluster_similarity_threshold: 0.8,
             keep_boundary_mutations: true
           ]
       end
@@ -338,12 +489,10 @@ defmodule Muex.Config do
     end
   end
 
-  defp resolve_tce(opts) do
-    cond do
-      Keyword.get(opts, :no_tce, false) -> false
-      Keyword.has_key?(opts, :tce) -> Keyword.get(opts, :tce)
-      true -> true
-    end
+  defp validate_tce_disabled(opts) do
+    if Keyword.get(opts, :tce, false),
+      do: {:error, "--tce is disabled because compiler-equivalence detection is not sound"},
+      else: :ok
   end
 
   defp parse_mutator_paths(nil), do: []
@@ -355,23 +504,45 @@ defmodule Muex.Config do
     |> Enum.reject(&(&1 == ""))
   end
 
-  @language_map %{
-                  "elixir" => Muex.Language.Elixir,
-                  "erlang" => Muex.Language.Erlang
-                }
-                |> Map.merge(Application.compile_env(:muex, :languages, %{}))
+  @language_map Map.merge(
+                  %{"elixir" => ElixirLanguage, "erlang" => Muex.Language.Erlang},
+                  Application.compile_env(:muex, :languages, %{})
+                )
   defp resolve_language(name) do
-    with module <-
-           Map.get_lazy(@language_map, name, fn ->
-             Module.concat([Muex.Language, Macro.camelize(name)])
-           end),
-         {:module, ^module} <- Code.ensure_loaded(module),
-         do: {:ok, module},
-         else: (_ -> {:error, "Unknown language: #{name}"})
+    module =
+      Map.get_lazy(@language_map, name, fn ->
+        Module.concat([Muex.Language, Macro.camelize(name)])
+      end)
+
+    case Code.ensure_loaded(module) do
+      {:module, ^module} -> {:ok, module}
+      _ -> {:error, "Unknown language: #{name}"}
+    end
   end
 
   @doc false
-  def all_mutators(extra_paths \\ [], language \\ Muex.Language.Elixir) do
+  def language_for_path(path) do
+    extension = Path.extname(path)
+
+    @language_map
+    |> Map.values()
+    |> Enum.uniq()
+    |> Enum.find_value(fn module ->
+      with {:module, ^module} <- Code.ensure_loaded(module),
+           true <- extension in module.file_extensions() do
+        module
+      else
+        _other -> nil
+      end
+    end)
+    |> case do
+      nil -> {:error, "no language adapter for #{extension}"}
+      module -> {:ok, module}
+    end
+  end
+
+  @doc false
+  def all_mutators(extra_paths \\ [], language \\ ElixirLanguage) do
     builtin = discover_mutators(:muex)
     external = load_external_mutators(extra_paths)
 
@@ -404,7 +575,9 @@ defmodule Muex.Config do
   end
 
   defp mutator?(mod) do
-    behaviours = mod.module_info(:attributes) |> Keyword.get_values(:behaviour) |> List.flatten()
+    behaviours =
+      :attributes |> mod.module_info() |> Keyword.get_values(:behaviour) |> List.flatten()
+
     Muex.Mutator in behaviours
   rescue
     _ -> false
