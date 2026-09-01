@@ -6,6 +6,7 @@ defmodule Muex.HardeningTest do
   alias Muex.Audit
   alias Muex.Checkpoint
   alias Muex.Compiler
+  alias Muex.Config
   alias Muex.Continuation
   alias Muex.Continuation.Artifact
   alias Muex.Coverage
@@ -685,6 +686,12 @@ defmodule Muex.HardeningTest do
 
     for name <- ~w(__block__ key cached_atom_in_list cached_atom_key location file),
         do: assert(name in names)
+  end
+
+  test "audit rendering resolves a language adapter per source extension" do
+    assert {:ok, Muex.Language.Elixir} = Config.language_for_path("lib/a.ex")
+    assert {:ok, Muex.Language.Erlang} = Config.language_for_path("src/a.erl")
+    assert {:error, _reason} = Config.language_for_path("README.md")
   end
 
   @tag :tmp_dir
