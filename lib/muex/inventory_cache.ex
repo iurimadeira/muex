@@ -29,7 +29,8 @@ defmodule Muex.InventoryCache do
   def publish(path, cache_key, input_fingerprint, mutations, plan_path) do
     envelope = envelope(path, cache_key, input_fingerprint, mutations, plan_path)
 
-    with :ok <- File.mkdir_p(Path.dirname(path)),
+    with :ok <- validate_envelope(envelope, cache_key, input_fingerprint),
+         :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- publish_plan(plan_path, cached_plan_path(path), envelope),
          :ok <- publish_envelope(path, envelope) do
       {:ok, metadata(path, envelope, "miss")}
@@ -192,6 +193,22 @@ defmodule Muex.InventoryCache do
     }
   end
 
+  # A `:safe` decode cannot create atoms, and `mix muex.continuation prepare`
+  # never runs a mutator, so every key the cache format may contain has to be
+  # interned by loading this module.
+  @cached_mutation_keys [
+    :id,
+    :ast,
+    :mutator,
+    :description,
+    :location,
+    :target_ordinal,
+    :original_ast,
+    :original_line,
+    :equivalent
+  ]
+  @cached_location_keys [:file, :line]
+
   defp validate_envelope(
          %{
            version: @version,
@@ -254,19 +271,24 @@ defmodule Muex.InventoryCache do
   defp valid?(true, _message), do: :ok
   defp valid?(false, message), do: {:error, message}
 
-  defp valid_mutation?(%{
-         id: id,
-         ast: _ast,
-         original_ast: _original_ast,
-         mutator: mutator,
-         description: description,
-         location: %{file: file, line: line}
-       }) do
+  defp valid_mutation?(
+         %{
+           id: id,
+           ast: _ast,
+           original_ast: _original_ast,
+           mutator: mutator,
+           description: description,
+           location: %{file: file, line: line} = location
+         } = mutation
+       ) do
     valid_digest?(id) and is_atom(mutator) and is_binary(description) and is_binary(file) and
-      is_integer(line) and line >= 0
+      is_integer(line) and line >= 0 and known_keys?(mutation, @cached_mutation_keys) and
+      known_keys?(location, @cached_location_keys)
   end
 
   defp valid_mutation?(_mutation), do: false
+
+  defp known_keys?(map, allowed), do: map |> Map.keys() |> Enum.all?(&(&1 in allowed))
 
   defp validate_plan(path, envelope) do
     plan_path = cached_plan_path(path)

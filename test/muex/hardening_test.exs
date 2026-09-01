@@ -640,6 +640,20 @@ defmodule Muex.HardeningTest do
   end
 
   @tag :tmp_dir
+  test "inventory cache rejects mutation keys it does not declare", %{tmp_dir: tmp_dir} do
+    cache = Path.join(tmp_dir, "cache/shard-1.etf")
+    plan = Path.join(tmp_dir, "audit/plan.json")
+    key = String.duplicate("c", 64)
+    mutation = Map.put(mutation(), :undeclared, true)
+
+    File.mkdir_p!(Path.dirname(plan))
+    File.write!(plan, ~s({"selected_count":1}))
+
+    assert {:error, "invalid mutation inventory cache mutations"} =
+             InventoryCache.publish(cache, key, "input", [mutation], plan)
+  end
+
+  @tag :tmp_dir
   test "inventory cache imports an exact subset with a rewritten audited plan", %{
     tmp_dir: tmp_dir
   } do
@@ -2508,6 +2522,27 @@ defmodule Muex.HardeningTest do
     assert [header] = checkpoint |> File.stream!() |> Enum.map(&Jason.decode!/1)
     assert header["total"] == 0
     assert header["campaign_fingerprint"] == "campaign"
+    assert report |> File.read!() |> Jason.decode!() |> get_in(["summary", "total"]) == 0
+  end
+
+  @tag :tmp_dir
+  test "an explicit report file is written for every output format", %{tmp_dir: tmp_dir} do
+    source = Path.join(tmp_dir, "lib/example.ex")
+    report = Path.join(tmp_dir, "report.json")
+    File.mkdir_p!(Path.dirname(source))
+    File.write!(source, "defmodule TerminalReport do\nend\n")
+
+    assert {:ok, config} =
+             Muex.Config.from_opts(
+               files: source,
+               project_root: tmp_dir,
+               test_paths: "test",
+               no_filter: true,
+               report_file: report
+             )
+
+    assert config.format == "terminal"
+    assert {:ok, %{results: []}} = ExUnit.CaptureIO.with_io(fn -> Muex.run(config) end) |> elem(0)
     assert report |> File.read!() |> Jason.decode!() |> get_in(["summary", "total"]) == 0
   end
 

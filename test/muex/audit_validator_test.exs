@@ -157,6 +157,37 @@ defmodule Muex.AuditValidatorTest do
   end
 
   @tag :tmp_dir
+  test "accepts patches against sources that are not rendered canonically", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "non-canonical-plan.json")
+
+    original =
+      "defmodule Example do\n  # keyword form plus a comment\n  def value, do: :original\nend\n"
+
+    mutated = "defmodule Example do\n  def value do\n    nil\n  end\nend\n"
+    write_json!(path, nested_plan(original, mutated))
+
+    assert {:ok, %{selected_ids: [_id]}} = Validator.validate_plan_file(path)
+
+    for drifted <- [
+          " defmodule Example do\n  def value do\n    nil\n  end\nend\n",
+          String.trim_trailing(mutated, "\n")
+        ] do
+      write_json!(path, nested_plan(original, drifted))
+      assert {:error, :plan_invalid_mutant_entry} = Validator.validate_plan_file(path)
+    end
+  end
+
+  @tag :tmp_dir
+  test "rejects patches against sources that cannot be parsed", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "unparsable-plan.json")
+    original = "defmodule Example do\n  def value, do: :original\n"
+    mutated = "defmodule Example do\n  def value do\n    nil\n  end\nend\n"
+    write_json!(path, nested_plan(original, mutated))
+
+    assert {:error, :plan_invalid_mutant_entry} = Validator.validate_plan_file(path)
+  end
+
+  @tag :tmp_dir
   test "rejects a checkpoint without a successful baseline", %{tmp_dir: tmp_dir} do
     fixture = valid_fixture!(tmp_dir)
     rows = fixture.checkpoint |> checkpoint_rows!() |> Enum.reject(&(&1["type"] == "baseline"))

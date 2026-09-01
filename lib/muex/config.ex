@@ -71,9 +71,19 @@ defmodule Muex.Config do
     * `--audit-dir` - Store the complete plan, append-only events, and process outputs
     * `--baseline-timeout` - Separate per-sandbox baseline timeout in milliseconds
     * `--mutant-id` - Select exactly one stable mutation ID
+    * `--mutant-ids-file` - Newline-delimited file of stable mutation IDs to run;
+      the shard-scoped form of `--mutant-id`
     * `--campaign-fingerprint` - Bind checkpoint evidence to an outer campaign
     * `--inventory-cache-file` / `--inventory-cache-key` - Reuse a
       campaign-owned, content-addressed mutation inventory and audited plan
+    * `--project-root` - Anchor for every relative path (default: derived from
+      `--files`)
+    * `--audit-only` / `--audit-plan` - Publish the optimized inventory to the
+      given exact path without running any test or mutant
+    * `--coverage-index-file` / `--coverage-corpus-fingerprint` - Consume a
+      campaign-owned coverage index instead of measuring coverage in-process
+    * `--changed-diff-file` - Supply the `--since` diff as a file instead of
+      shelling out to git
     * `--preset` - Framework preset that prunes noisy DSL calls: `phoenix`,
       `ecto`, `ash`, or `none` (default: `none`).
 

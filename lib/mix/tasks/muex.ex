@@ -41,6 +41,21 @@ defmodule Mix.Tasks.Muex do
     * `--mutant-id` - Deterministically select one mutation ID from the generated plan
     * `--preset` - Framework preset to prune DSL noise: phoenix, ecto, ash, none (default: none)
 
+  ## Campaign options
+
+  These are the seam an external campaign wrapper drives; see
+  `docs/CAMPAIGN_API.md` for the full contract.
+
+    * `--project-root` - Anchor for every relative path
+    * `--mutant-ids-file` - Newline-delimited stable mutation IDs for one shard
+    * `--campaign-fingerprint` - Bind checkpoint evidence to an outer campaign
+    * `--inventory-cache-file` / `--inventory-cache-key` - Reuse a campaign-owned
+      content-addressed inventory across shard invocations
+    * `--coverage-index-file` / `--coverage-corpus-fingerprint` - Consume a
+      campaign-owned coverage index instead of measuring coverage in-process
+    * `--changed-diff-file` - Supply the `--since` diff as a file
+    * `--mutator-paths` - Comma-separated directories of custom mutator modules
+
   ## Examples
 
       mix muex                          # Run with intelligent filtering
