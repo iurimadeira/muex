@@ -12,6 +12,7 @@ defmodule Mix.Tasks.Muex.Coverage do
     project_root: :string,
     source_files: :string,
     test_files: :string,
+    corpus_test_files: :string,
     parts_file: :string,
     expected_tests_file: :string,
     index: :string,
@@ -35,11 +36,15 @@ defmodule Mix.Tasks.Muex.Coverage do
   end
 
   def run(["export" | args]) do
-    opts = parse!(args, ~w(project_root source_files test_files index audit_dir)a)
+    opts =
+      parse!(args, ~w(project_root source_files test_files corpus_test_files index audit_dir)a)
+
     root = opts |> Keyword.fetch!(:project_root) |> Path.expand()
     source_files = read_lines(Keyword.fetch!(opts, :source_files))
     relative_tests = read_lines(Keyword.fetch!(opts, :test_files))
+    corpus_tests = read_lines(Keyword.fetch!(opts, :corpus_test_files))
     test_files = Enum.map(relative_tests, &Path.expand(&1, root))
+    corpus_test_files = Enum.map(corpus_tests, &Path.expand(&1, root))
 
     file_to_module = coverage_modules(source_files, root)
 
@@ -60,7 +65,7 @@ defmodule Mix.Tasks.Muex.Coverage do
       Coverage.corpus_fingerprint(
         root,
         source_files,
-        test_files,
+        corpus_test_files,
         System.get_env("MUEX_COVERAGE_MODULES_FILE")
       )
 
@@ -68,6 +73,8 @@ defmodule Mix.Tasks.Muex.Coverage do
       version: 1,
       partition: Keyword.get(opts, :partition),
       tests: relative_tests,
+      corpus_test_count: length(corpus_tests),
+      corpus_tests_sha256: sha256_term(Enum.sort(corpus_tests)),
       index_sha256: sha256_file!(index_path),
       corpus_fingerprint: corpus_fingerprint,
       evidence: batch_evidence,
@@ -89,9 +96,14 @@ defmodule Mix.Tasks.Muex.Coverage do
     manifests = Enum.map(parts, &read_part!/1)
     actual_tests = Enum.flat_map(manifests, & &1["tests"])
     corpus_fingerprints = manifests |> Enum.map(& &1["corpus_fingerprint"]) |> Enum.uniq()
+    expected_tests_sha256 = sha256_term(expected_tests)
 
     if length(actual_tests) != length(Enum.uniq(actual_tests)) or
-         Enum.sort(actual_tests) != expected_tests or length(corpus_fingerprints) != 1 do
+         Enum.sort(actual_tests) != expected_tests or length(corpus_fingerprints) != 1 or
+         Enum.any?(manifests, fn manifest ->
+           manifest["corpus_test_count"] != length(expected_tests) or
+             manifest["corpus_tests_sha256"] != expected_tests_sha256
+         end) do
       Mix.raise("coverage partitions are not disjoint and exhaustive")
     end
 
@@ -183,27 +195,33 @@ defmodule Mix.Tasks.Muex.Coverage do
 
   defp read_part!(path) do
     manifest = path <> ".manifest.json"
+    decoded = manifest |> File.read!() |> Jason.decode!()
 
-    case manifest |> File.read!() |> Jason.decode!() do
-      %{
-        "version" => 1,
-        "tests" => tests,
-        "index_sha256" => sha256,
-        "corpus_fingerprint" => corpus_fingerprint,
-        "evidence" => evidence
-      } =
-          decoded
-      when is_list(tests) and is_binary(sha256) and is_binary(corpus_fingerprint) and
-             is_list(evidence) ->
-        if Enum.all?(tests, &is_binary/1) and sha256 == sha256_file!(path) and
-             valid_batch?(decoded["batch"], tests, evidence),
-           do: decoded,
-           else: Mix.raise("invalid coverage partition: #{path}")
-
-      _other ->
-        Mix.raise("invalid coverage partition manifest: #{manifest}")
-    end
+    if valid_partition_manifest?(decoded, path),
+      do: decoded,
+      else: Mix.raise("invalid coverage partition: #{path}")
   end
+
+  defp valid_partition_manifest?(
+         %{
+           "version" => 1,
+           "tests" => tests,
+           "corpus_test_count" => corpus_test_count,
+           "corpus_tests_sha256" => corpus_tests_sha256,
+           "index_sha256" => sha256,
+           "corpus_fingerprint" => corpus_fingerprint,
+           "evidence" => evidence
+         } = decoded,
+         path
+       )
+       when is_list(tests) and is_integer(corpus_test_count) and
+              is_binary(corpus_tests_sha256) and is_binary(sha256) and
+              is_binary(corpus_fingerprint) and is_list(evidence) do
+    Enum.all?(tests, &is_binary/1) and sha256 == sha256_file!(path) and
+      valid_batch?(decoded["batch"], tests, evidence)
+  end
+
+  defp valid_partition_manifest?(_decoded, _path), do: false
 
   defp valid_batch?(
          %{

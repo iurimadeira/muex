@@ -36,6 +36,14 @@ defmodule Muex.Audit.Validator do
   end
 
   @doc false
+  def validate_plan_file(path) do
+    with {:ok, plan, plan_hash} <- read_json(Path.expand(path)),
+         {:ok, selected_ids} <- validate_plan(plan) do
+      {:ok, %{plan: plan, sha256: plan_hash, selected_ids: selected_ids}}
+    end
+  end
+
+  @doc false
   def validate_evidence(opts) do
     with {:ok, paths} <- required_evidence_paths(opts),
          {:ok, plan, plan_hash} <- read_json(paths.plan),

@@ -42,13 +42,9 @@ defmodule Muex.Coverage do
   @doc "Reads and validates a versioned coverage index."
   @spec read_index!(Path.t()) :: t()
   def read_index!(path) do
-    case path |> File.read!() |> :erlang.binary_to_term([:safe]) do
-      %{version: @index_version, index: index} when map_size(index) >= 0 ->
-        validate_index!(index)
-
-      _other ->
-        raise ArgumentError, "invalid coverage index: unsupported version or shape"
-    end
+    path
+    |> File.read!()
+    |> decode_index!()
   rescue
     error in [ArgumentError] ->
       reraise ArgumentError,
@@ -56,19 +52,46 @@ defmodule Muex.Coverage do
               __STACKTRACE__
   end
 
+  defp decode_index!(binary) do
+    case :erlang.binary_to_term(binary, [:safe]) do
+      %{version: @index_version, index: index} when map_size(index) >= 0 ->
+        validate_index!(index)
+
+      _other ->
+        raise ArgumentError, "invalid coverage index: unsupported version or shape"
+    end
+  end
+
   @doc false
   def read_bound_index(path, expected_fingerprint) do
+    case read_bound_index_snapshot(path, expected_fingerprint) do
+      {:ok, snapshot} -> {:ok, snapshot.index}
+      :stale -> :stale
+    end
+  end
+
+  @doc false
+  def read_bound_index_snapshot(path, expected_fingerprint) do
     manifest_path = path <> ".manifest.json"
 
-    with {:ok, body} <- File.read(manifest_path),
-         {:ok, manifest} <- Jason.decode(body),
+    with {:ok, index_bytes} <- File.read(path),
+         digest = sha256(index_bytes),
+         {:ok, manifest_bytes} <- File.read(manifest_path),
+         {:ok, manifest} <- Jason.decode(manifest_bytes),
          true <- manifest["version"] == 1,
          true <- manifest["corpus_fingerprint"] == expected_fingerprint,
-         true <- manifest["index_sha256"] == sha256_file(path) do
-      {:ok, read_index!(path)}
+         true <- manifest["index_sha256"] == digest,
+         {:ok, index} <- decode_index(index_bytes) do
+      {:ok, %{index: index, sha256: digest}}
     else
       _stale_or_missing -> :stale
     end
+  end
+
+  defp decode_index(binary) do
+    {:ok, decode_index!(binary)}
+  rescue
+    _error in ArgumentError -> :stale
   end
 
   @doc false
@@ -191,7 +214,7 @@ defmodule Muex.Coverage do
 
   defp fingerprint_optional_file(nil), do: nil
   defp fingerprint_optional_file(""), do: nil
-  defp fingerprint_optional_file(path), do: {Path.expand(path), sha256_file(path)}
+  defp fingerprint_optional_file(path), do: sha256_file(path)
 
   defp sha256_file(path) do
     case File.read(path) do

@@ -190,6 +190,7 @@ defmodule Muex.Config do
                changed_diff_file: :string,
                coverage_guided: :boolean,
                coverage_index_file: :string,
+               coverage_corpus_fingerprint: :string,
                optimize_level: :string,
                min_complexity: :integer,
                max_per_function: :integer,
@@ -247,6 +248,7 @@ defmodule Muex.Config do
           changed_diff_file: Keyword.get(opts, :changed_diff_file),
           checkpoint: Keyword.get(opts, :checkpoint),
           coverage_index_file: Keyword.get(opts, :coverage_index_file),
+          coverage_corpus_fingerprint: Keyword.get(opts, :coverage_corpus_fingerprint),
           inventory_cache_file: Keyword.get(opts, :inventory_cache_file),
           inventory_cache_key: Keyword.get(opts, :inventory_cache_key)
         },
@@ -289,10 +291,22 @@ defmodule Muex.Config do
   end
 
   defp validate_coverage_index(opts) do
-    if Keyword.has_key?(opts, :coverage_index_file) and
-         not Keyword.get(opts, :coverage_guided, false),
-       do: {:error, "--coverage-index-file requires --coverage-guided"},
-       else: :ok
+    index? = Keyword.has_key?(opts, :coverage_index_file)
+    fingerprint = Keyword.get(opts, :coverage_corpus_fingerprint)
+
+    cond do
+      index? and not Keyword.get(opts, :coverage_guided, false) ->
+        {:error, "--coverage-index-file requires --coverage-guided"}
+
+      is_binary(fingerprint) and not index? ->
+        {:error, "--coverage-corpus-fingerprint requires --coverage-index-file"}
+
+      is_binary(fingerprint) and not Regex.match?(~r/\A[a-f0-9]{64}\z/, fingerprint) ->
+        {:error, "--coverage-corpus-fingerprint must be a lowercase SHA-256 digest"}
+
+      true ->
+        :ok
+    end
   end
 
   defp validate_inventory_cache(opts) do

@@ -5,6 +5,7 @@ defmodule Muex.Config.Internal do
           changed_diff_file: Path.t() | nil,
           checkpoint: Path.t() | nil,
           coverage_index_file: Path.t() | nil,
+          coverage_corpus_fingerprint: String.t() | nil,
           inventory_cache_file: Path.t() | nil,
           inventory_cache_key: String.t() | nil
         }
@@ -13,6 +14,7 @@ defmodule Muex.Config.Internal do
     :changed_diff_file,
     :checkpoint,
     :coverage_index_file,
+    :coverage_corpus_fingerprint,
     :inventory_cache_file,
     :inventory_cache_key
   ]

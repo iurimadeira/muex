@@ -149,6 +149,8 @@ defmodule Muex.HardeningTest do
                source_files,
                "--test-files",
                test_files,
+               "--corpus-test-files",
+               test_files,
                "--index",
                index_path,
                "--audit-dir",
@@ -163,6 +165,58 @@ defmodule Muex.HardeningTest do
     assert manifest["batch"]["test_count"] == 2
     assert Enum.sort(manifest["batch"]["evidence"]) == Enum.sort(manifest["evidence"])
     assert Enum.all?(manifest["batch"]["evidence"], &File.regular?(&1["path"]))
+  end
+
+  @tag :tmp_dir
+  test "coverage partitions bind to one global corpus fingerprint before merge", %{
+    tmp_dir: tmp_dir
+  } do
+    project = coverage_fixture!(tmp_dir)
+    source_files = Path.join(tmp_dir, "source-files.txt")
+    first_tests = Path.join(tmp_dir, "first-tests.txt")
+    second_tests = Path.join(tmp_dir, "second-tests.txt")
+    corpus_tests = Path.join(tmp_dir, "corpus-tests.txt")
+    File.write!(source_files, "lib/example.ex\n")
+    File.write!(first_tests, "test/example_test.exs\n")
+    File.write!(second_tests, "test/other_test.exs\n")
+    File.write!(corpus_tests, "test/example_test.exs\ntest/other_test.exs\n")
+
+    manifests =
+      for {partition, tests} <- [{1, first_tests}, {2, second_tests}] do
+        index = Path.join(tmp_dir, "partition-#{partition}.etf")
+        Mix.Task.reenable("muex.coverage")
+
+        assert :ok =
+                 Mix.Tasks.Muex.Coverage.run([
+                   "export",
+                   "--project-root",
+                   project,
+                   "--source-files",
+                   source_files,
+                   "--test-files",
+                   tests,
+                   "--corpus-test-files",
+                   corpus_tests,
+                   "--index",
+                   index,
+                   "--audit-dir",
+                   Path.join(tmp_dir, "audit-#{partition}"),
+                   "--partition",
+                   Integer.to_string(partition)
+                 ])
+
+        Jason.decode!(File.read!(index <> ".manifest.json"))
+      end
+
+    assert [fingerprint] = manifests |> Enum.map(& &1["corpus_fingerprint"]) |> Enum.uniq()
+
+    assert fingerprint ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/example_test.exs", "test/other_test.exs"],
+               System.get_env("MUEX_COVERAGE_MODULES_FILE")
+             )
   end
 
   @tag :tmp_dir
@@ -272,12 +326,26 @@ defmodule Muex.HardeningTest do
 
     File.write!(
       first <> ".manifest.json",
-      Jason.encode!(coverage_partition_manifest(first, ["test/a_test.exs"], first_evidence))
+      Jason.encode!(
+        coverage_partition_manifest(
+          first,
+          ["test/a_test.exs"],
+          first_evidence,
+          ["test/a_test.exs", "test/b_test.exs"]
+        )
+      )
     )
 
     File.write!(
       second <> ".manifest.json",
-      Jason.encode!(coverage_partition_manifest(second, ["test/b_test.exs"], second_evidence))
+      Jason.encode!(
+        coverage_partition_manifest(
+          second,
+          ["test/b_test.exs"],
+          second_evidence,
+          ["test/a_test.exs", "test/b_test.exs"]
+        )
+      )
     )
 
     File.write!(parts, Enum.join([first, second], "\n") <> "\n")
@@ -317,7 +385,7 @@ defmodule Muex.HardeningTest do
 
     invalid =
       part
-      |> coverage_partition_manifest(["test/a_test.exs"], coverdata)
+      |> coverage_partition_manifest(["test/a_test.exs"], coverdata, ["test/a_test.exs"])
       |> put_in([:batch, :tests], ["test/b_test.exs"])
 
     File.write!(part <> ".manifest.json", Jason.encode!(invalid))
@@ -417,6 +485,27 @@ defmodule Muex.HardeningTest do
              ])
 
     assert coverage_config.internal.coverage_index_file == "coverage.etf"
+
+    global_coverage_fingerprint = String.duplicate("b", 64)
+
+    assert {:ok, shard_coverage_config} =
+             Muex.Config.from_args([
+               "--coverage-guided",
+               "--coverage-index-file",
+               "coverage.etf",
+               "--coverage-corpus-fingerprint",
+               global_coverage_fingerprint
+             ])
+
+    assert shard_coverage_config.internal.coverage_corpus_fingerprint ==
+             global_coverage_fingerprint
+
+    assert {:error, "--coverage-corpus-fingerprint requires --coverage-index-file"} =
+             Muex.Config.from_args([
+               "--coverage-guided",
+               "--coverage-corpus-fingerprint",
+               global_coverage_fingerprint
+             ])
 
     assert {:error, "--inventory-cache-file and --inventory-cache-key must be provided together"} =
              Muex.Config.from_args(["--inventory-cache-file", "inventory.etf"])
@@ -2750,7 +2839,7 @@ defmodule Muex.HardeningTest do
     ]
   end
 
-  defp coverage_partition_manifest(index_path, tests, evidence_path) do
+  defp coverage_partition_manifest(index_path, tests, evidence_path, corpus_tests) do
     evidence = [
       %{
         path: evidence_path,
@@ -2762,6 +2851,8 @@ defmodule Muex.HardeningTest do
     %{
       version: 1,
       corpus_fingerprint: "fixture-corpus",
+      corpus_test_count: length(corpus_tests),
+      corpus_tests_sha256: sha256_term(corpus_tests),
       tests: tests,
       index_sha256: sha256_file!(index_path),
       evidence: evidence,
@@ -2777,6 +2868,12 @@ defmodule Muex.HardeningTest do
   defp sha256_file!(path) do
     :sha256
     |> :crypto.hash(File.read!(path))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp sha256_term(term) do
+    :sha256
+    |> :crypto.hash(:erlang.term_to_binary(Enum.sort(term)))
     |> Base.encode16(case: :lower)
   end
 

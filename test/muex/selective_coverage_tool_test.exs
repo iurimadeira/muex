@@ -181,6 +181,15 @@ defmodule Muex.SelectiveCoverageToolTest do
 
     assert {:ok, ^index} = Coverage.read_bound_index(index_path, fingerprint)
 
+    assert {:ok, %{index: ^index, sha256: digest}} =
+             Coverage.read_bound_index_snapshot(index_path, fingerprint)
+
+    assert digest == sha256_file!(index_path)
+
+    File.write!(index_path, "malformed")
+    assert :stale = Coverage.read_bound_index_snapshot(index_path, fingerprint)
+    Coverage.write_index!(index, index_path)
+
     for {path, replacement} <- [
           {source, "defmodule Changed do\nend\n"},
           {test_file, "changed test"},

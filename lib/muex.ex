@@ -589,12 +589,13 @@ defmodule Muex do
     test_files = Muex.Config.expand_test_paths(test_paths)
 
     expected =
-      Muex.Coverage.corpus_fingerprint(
-        project_root,
-        Map.keys(file_to_module),
-        test_files,
-        System.get_env("MUEX_COVERAGE_MODULES_FILE")
-      )
+      config.internal.coverage_corpus_fingerprint ||
+        Muex.Coverage.corpus_fingerprint(
+          project_root,
+          Map.keys(file_to_module),
+          test_files,
+          System.get_env("MUEX_COVERAGE_MODULES_FILE")
+        )
 
     case Muex.Coverage.read_bound_index(path, expected) do
       {:ok, index} -> index
@@ -709,6 +710,7 @@ defmodule Muex do
       |> Map.from_struct()
       |> Map.delete(:internal)
       |> Map.put(:coverage_index_file, config.internal.coverage_index_file)
+      |> Map.put(:coverage_corpus_fingerprint, config.internal.coverage_corpus_fingerprint)
       |> Map.put(:inventory_cache_file, config.internal.inventory_cache_file)
       |> Map.put(:inventory_cache_key, config.internal.inventory_cache_key)
       |> Map.drop([

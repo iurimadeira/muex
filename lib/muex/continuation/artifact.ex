@@ -338,23 +338,53 @@ defmodule Muex.Continuation.Artifact do
   defp write_lines(path, lines),
     do: File.write(path, Enum.map_join(lines, "", &(&1 <> "\n")), [:binary, :sync, :exclusive])
 
-  defp atomic_json(path, value) do
+  @doc false
+  def publish_json(path, value) do
+    parent = path |> Path.dirname() |> Path.expand()
     temporary = path <> ".tmp.#{System.unique_integer([:positive])}"
 
+    with :ok <- File.mkdir_p(parent),
+         {:ok, identity} <- directory_identity(parent),
+         :ok <- publish_in_directory(path, temporary, value, parent, identity) do
+      :ok
+    else
+      {:error, reason} ->
+        {:error, {:cannot_publish_artifact, reason}}
+    end
+  end
+
+  defp atomic_json(path, value), do: publish_json(path, value)
+
+  defp directory_identity(path) do
+    with {:ok, %File.Stat{type: :directory} = stat} <- File.lstat(path),
+         {:ok, canonical} <- canonical_existing(path),
+         true <- canonical == path do
+      {:ok, {stat.major_device, stat.minor_device, stat.inode}}
+    else
+      _unsafe -> {:error, :unsafe_artifact_directory}
+    end
+  end
+
+  defp verify_directory_identity(path, expected) do
+    case directory_identity(path) do
+      {:ok, ^expected} -> :ok
+      _changed -> {:error, :artifact_directory_changed}
+    end
+  end
+
+  defp publish_in_directory(path, temporary, value, parent, identity) do
     with :ok <-
            File.write(temporary, Jason.encode!(value, pretty: true) <> "\n", [
              :binary,
              :sync,
              :exclusive
            ]),
-         :ok <- File.ln(temporary, path),
-         :ok <- File.rm(temporary) do
-      :ok
-    else
-      {:error, reason} ->
-        File.rm(temporary)
-        {:error, {:cannot_publish_artifact, reason}}
+         :ok <- verify_directory_identity(parent, identity),
+         :ok <- File.ln(temporary, path) do
+      verify_directory_identity(parent, identity)
     end
+  after
+    if verify_directory_identity(parent, identity) == :ok, do: File.rm(temporary)
   end
 
   defp digest(term), do: term |> :erlang.term_to_binary() |> sha256()
