@@ -1,6 +1,63 @@
 defmodule Mix.Tasks.Muex.Coverage do
-  @shortdoc false
-  @moduledoc false
+  @shortdoc "Builds, merges, and validates a campaign coverage index"
+
+  @moduledoc """
+  Builds the coverage index a campaign binds itself to.
+
+  This is the coverage half of the seam documented in `docs/CAMPAIGN_API.md`;
+  read that file for how the artifacts below feed `mix muex.campaign build`,
+  `mix muex.campaign slice`, and a shard run.
+
+  ## Subcommands
+
+  `manifest` writes the selective module manifest for the campaign's sources,
+  resolved against the current `Mix.Project.compile_path/0`:
+
+      mix muex.coverage manifest --project-root . \\
+        --source-files sources.txt --output selective.json
+
+  `export` runs the given tests under `Muex.Coverage.SelectiveTool` and writes
+  a coverage index plus its adjacent `<index>.manifest.json`:
+
+      mix muex.coverage export --project-root . \\
+        --source-files sources.txt --test-files part-1.txt \\
+        --corpus-test-files tests.txt --partition 1 \\
+        --index part-1.etf --audit-dir audit/part-1
+
+  `merge` joins partition indexes into one index and manifest, and `validate`
+  re-checks an index against its manifest:
+
+      mix muex.coverage merge --parts-file parts.txt \\
+        --expected-tests-file tests.txt --index coverage.etf \\
+        --manifest coverage.manifest.json
+
+      mix muex.coverage validate --expected-tests-file tests.txt \\
+        --index coverage.etf --manifest coverage.manifest.json
+
+  `--parts-file` lists *index* paths; each must still have its adjacent
+  `<index>.manifest.json`, and `merge` mirrors its output manifest to the
+  index's adjacent path when `--manifest` names a different file.
+
+  ## Inputs
+
+  Every path option is read as given; newline-delimited list files ignore blank
+  lines. `MUEX_COVERAGE_MODULES_FILE` selects the manifest written by
+  `manifest`: `export` instruments exactly its modules and folds the file into
+  the index's `corpus_fingerprint`. Leaving it unset makes `export` load the
+  sources itself and fingerprint without a selective manifest, so it must be
+  set identically for `export` and for the `--selective-manifest` of
+  `mix muex.campaign build`.
+
+  ## Failures
+
+  Every failure raises `Mix.Error`: unknown subcommands, missing or invalid
+  options, a partition whose manifest no longer matches its index
+  (`invalid coverage partition`), partitions that are not disjoint and
+  exhaustive over the expected corpus, and an index that drifted from its
+  manifest (`coverage index validation failed`). A fingerprint mismatch is not
+  raised here — it surfaces later as a degraded campaign slice, see
+  `docs/CAMPAIGN_API.md`.
+  """
 
   use Mix.Task
 
