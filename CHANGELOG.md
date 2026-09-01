@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Public coverage seam**: `mix muex.coverage` (`manifest`, `export`, `merge`, `validate`) and `Muex.Coverage.SelectiveTool` are now documented public API, with the full coverage-guided orchestrator flow — artifacts, inputs, fingerprint binding, and degradation semantics — in [docs/CAMPAIGN_API.md](docs/CAMPAIGN_API.md). `Muex.Coverage.SelectiveTool.read_manifest!/2` is now documented and specced. No behaviour changed.
+
 ## [0.10.0] - 2026-09-01
 
 Adds the public seam an external orchestrator uses to run one mutation campaign
@@ -50,5 +55,6 @@ Special thanks to [@e-fu](https://github.com/e-fu) for extensive bug reports, de
 ### Changed
 - **Mutator Type Spec**: Made `:original_ast`, `:original_line`, and `:equivalent` optional keys in `@type Muex.Mutator.mutation()` map spec to prevent type friction for external mutators.
 
+[Unreleased]: https://github.com/iurimadeira/muex/compare/v0.10.0...HEAD
 [0.10.0]: https://github.com/iurimadeira/muex/compare/v0.9.1...v0.10.0
 [0.9.0]: https://github.com/iurimadeira/muex/compare/v0.8.3...v0.9.0
