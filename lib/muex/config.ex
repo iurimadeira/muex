@@ -198,6 +198,8 @@ defmodule Muex.Config do
                checkpoint: :string,
                report_file: :string,
                audit_dir: :string,
+               audit_only: :boolean,
+               audit_plan: :string,
                baseline_timeout: :integer,
                mutant_id: :string,
                mutant_ids_file: :string,
@@ -237,6 +239,7 @@ defmodule Muex.Config do
          :ok <- validate_positive(opts, :baseline_timeout),
          :ok <- validate_coverage_index(opts),
          :ok <- validate_inventory_cache(opts),
+         :ok <- validate_audit_only(opts),
          :ok <- validate_mutant_selection(opts),
          :ok <- validate_tce_disabled(opts) do
       config = %__MODULE__{
@@ -245,6 +248,8 @@ defmodule Muex.Config do
         app: app,
         project_root: project_root,
         internal: %Internal{
+          audit_only: Keyword.get(opts, :audit_only, false),
+          audit_plan: Keyword.get(opts, :audit_plan),
           changed_diff_file: Keyword.get(opts, :changed_diff_file),
           checkpoint: Keyword.get(opts, :checkpoint),
           coverage_index_file: Keyword.get(opts, :coverage_index_file),
@@ -288,6 +293,22 @@ defmodule Muex.Config do
     if Keyword.has_key?(opts, :mutant_id) and Keyword.has_key?(opts, :mutant_ids_file),
       do: {:error, "--mutant-id and --mutant-ids-file are mutually exclusive"},
       else: :ok
+  end
+
+  defp validate_audit_only(opts) do
+    audit_only? = Keyword.get(opts, :audit_only, false)
+    audit_plan = Keyword.get(opts, :audit_plan)
+
+    cond do
+      audit_only? and (not is_binary(audit_plan) or audit_plan == "") ->
+        {:error, "--audit-only requires --audit-plan"}
+
+      is_binary(audit_plan) and not audit_only? ->
+        {:error, "--audit-plan requires --audit-only"}
+
+      true ->
+        :ok
+    end
   end
 
   defp validate_coverage_index(opts) do

@@ -79,11 +79,14 @@ defmodule Muex do
   or `{:error, reason}` on failure. Never calls `Mix.raise` or `System.halt`;
   the caller decides how to handle the outcome.
   """
-  @spec run(Muex.Config.t()) :: {:ok, map()} | {:error, String.t()}
+  @spec run(Muex.Config.t()) :: {:ok, map()} | {:error, term()}
   def run(%Muex.Config{} = config) do
     log("Loading files from #{Enum.join(config.files, ", ")}...", config.verbose)
 
     case Muex.Loader.load_all(config.files, config.language) do
+      {:ok, []} when config.internal.audit_only ->
+        do_run(config, [])
+
       {:ok, []} ->
         {:ok, %{results: [], score_low: 0.0, score_high: 0.0}}
 
@@ -146,12 +149,19 @@ defmodule Muex do
         input_fingerprint =
           inventory_fingerprint(config, all_files, files, source_selections, changed)
 
-        case Muex.InventoryCache.load(
-               config.internal.inventory_cache_file,
-               config.internal.inventory_cache_key,
-               input_fingerprint,
-               config.audit_dir
-             ) do
+        inventory_state =
+          if config.internal.audit_only do
+            :disabled
+          else
+            Muex.InventoryCache.load(
+              config.internal.inventory_cache_file,
+              config.internal.inventory_cache_key,
+              input_fingerprint,
+              config.audit_dir
+            )
+          end
+
+        case inventory_state do
           {:ok, all_mutations, provenance} ->
             log(
               "Mutation inventory cache hit: #{length(all_mutations)} mutation(s)",
@@ -227,18 +237,64 @@ defmodule Muex do
     with {:ok, all_mutations, optimizer_reasons} <- select_mutations(candidates, config),
          selection_reasons = Map.merge(preselection_reasons, optimizer_reasons),
          :ok <-
-           Muex.Audit.write_plan(
-             config.audit_dir,
+           write_audit_plan(
+             config,
              generated,
              generation_decisions,
              all_mutations,
              selection_reasons,
-             {files, all_files, source_selections},
-             config
+             {files, all_files, source_selections}
            ),
          :ok <- maybe_publish_inventory(config, input_fingerprint, all_mutations, cache_state) do
-      run_selected_mutations(config, files, all_mutations)
+      if config.internal.audit_only do
+        {:ok,
+         %{
+           audit_only: true,
+           audit_plan: config.internal.audit_plan,
+           selected_count: length(all_mutations)
+         }}
+      else
+        run_selected_mutations(config, files, all_mutations)
+      end
     end
+  end
+
+  defp write_audit_plan(
+         %Muex.Config{internal: %{audit_only: true, audit_plan: path}} = config,
+         candidates,
+         generation_decisions,
+         selected,
+         selection_reasons,
+         sources
+       ) do
+    Muex.Audit.write_plan_file(
+      path,
+      candidates,
+      generation_decisions,
+      selected,
+      selection_reasons,
+      sources,
+      config
+    )
+  end
+
+  defp write_audit_plan(
+         config,
+         candidates,
+         generation_decisions,
+         selected,
+         selection_reasons,
+         sources
+       ) do
+    Muex.Audit.write_plan(
+      config.audit_dir,
+      candidates,
+      generation_decisions,
+      selected,
+      selection_reasons,
+      sources,
+      config
+    )
   end
 
   defp maybe_publish_inventory(_config, _input_fingerprint, _mutations, :disabled), do: :ok

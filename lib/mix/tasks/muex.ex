@@ -35,6 +35,8 @@ defmodule Mix.Tasks.Muex do
     * `--checkpoint` - Append terminal mutation results to a resumable JSONL checkpoint
     * `--report-file` - Write the structured report atomically to this exact path
     * `--audit-dir` - Write full plans, attempt events, and untruncated process output artifacts
+    * `--audit-only` - Generate optimized inventory without running tests or mutants
+    * `--audit-plan` - Exact authoritative plan output path required by --audit-only
     * `--baseline-timeout` - Separate timeout in milliseconds for each sandbox baseline
     * `--mutant-id` - Deterministically select one mutation ID from the generated plan
     * `--preset` - Framework preset to prune DSL noise: phoenix, ecto, ash, none (default: none)
@@ -56,6 +58,7 @@ defmodule Mix.Tasks.Muex do
       mix muex --preset phoenix           # Prune Phoenix component/router DSL noise
       mix muex --since main               # Only mutate lines changed since main
       mix muex --coverage-guided          # Run only tests covering each mutated line
+      mix muex --audit-only --audit-plan tmp/plan.json
       mix muex --files "lib/my_module.ex" --test-paths "test/my_module_test.exs"
   """
 
@@ -68,34 +71,41 @@ defmodule Mix.Tasks.Muex do
         Mix.raise(reason)
 
       {:ok, config} ->
-        case Muex.run(config) do
-          {:error, reason} ->
-            Mix.raise(reason)
-
-          {:ok, %{results: [], score_low: score_low, score_high: score_high}} ->
-            Mix.shell().info("No mutations to test; nothing to score.")
-
-            if score_low < config.fail_at do
-              score_str =
-                if score_low == score_high,
-                  do: "#{score_low}%",
-                  else: "#{score_low}%..#{score_high}%"
-
-              Mix.raise("Mutation score #{score_str} is below threshold #{config.fail_at}%")
-            end
-
-          {:ok, %{score_low: score_low, score_high: score_high}} ->
-            # Use the pessimistic (low) bound for threshold comparison.
-            # If even the best-case interpretation fails, the score is too low.
-            if score_low < config.fail_at do
-              score_str =
-                if score_low == score_high,
-                  do: "#{score_low}%",
-                  else: "#{score_low}%..#{score_high}%"
-
-              Mix.raise("Mutation score #{score_str} is below threshold #{config.fail_at}%")
-            end
-        end
+        config |> Muex.run() |> handle_result(config)
     end
   end
+
+  defp handle_result({:error, reason}, _config), do: Mix.raise(error_message(reason))
+
+  defp handle_result(
+         {:ok, %{audit_only: true, audit_plan: path, selected_count: selected_count}},
+         _config
+       ) do
+    Mix.shell().info(
+      "Audit inventory published to #{path} with #{selected_count} selected mutations"
+    )
+
+    :ok
+  end
+
+  defp handle_result({:ok, %{results: []} = result}, config) do
+    Mix.shell().info("No mutations to test; nothing to score.")
+    enforce_score(result, config)
+  end
+
+  defp handle_result({:ok, result}, config), do: enforce_score(result, config)
+
+  defp enforce_score(%{score_low: score_low, score_high: score_high}, config) do
+    if score_low < config.fail_at do
+      score_str =
+        if score_low == score_high,
+          do: "#{score_low}%",
+          else: "#{score_low}%..#{score_high}%"
+
+      Mix.raise("Mutation score #{score_str} is below threshold #{config.fail_at}%")
+    end
+  end
+
+  defp error_message(reason) when is_binary(reason), do: reason
+  defp error_message(reason), do: inspect(reason)
 end

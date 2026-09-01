@@ -139,6 +139,24 @@ defmodule Muex.AuditValidatorTest do
   end
 
   @tag :tmp_dir
+  test "nested patches preserve every byte outside the indented replacement", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "nested-plan.json")
+    original = "defmodule Example do\n  def value do\n    :original\n  end\nend\n"
+    mutated = "defmodule Example do\n  def value do\n    nil\n  end\nend\n"
+    write_json!(path, nested_plan(original, mutated))
+
+    assert {:ok, %{selected_ids: [_id]}} = Validator.validate_plan_file(path)
+
+    for drifted <- [
+          " defmodule Example do\n  def value do\n    nil\n  end\nend\n",
+          String.trim_trailing(mutated, "\n")
+        ] do
+      write_json!(path, nested_plan(original, drifted))
+      assert {:error, :plan_invalid_mutant_entry} = Validator.validate_plan_file(path)
+    end
+  end
+
+  @tag :tmp_dir
   test "rejects a checkpoint without a successful baseline", %{tmp_dir: tmp_dir} do
     fixture = valid_fixture!(tmp_dir)
     rows = fixture.checkpoint |> checkpoint_rows!() |> Enum.reject(&(&1["type"] == "baseline"))
@@ -534,6 +552,48 @@ defmodule Muex.AuditValidatorTest do
       "original_sha256" => sha256("1"),
       "mutated_source" => "2",
       "mutated_sha256" => sha256("2")
+    }
+  end
+
+  defp nested_plan(original, mutated) do
+    patch = %{"before" => "def value do\n  :original\nend", "after" => "def value do\n  nil\nend"}
+
+    id =
+      Muex.mutation_id(
+        "Muex.Mutator.ReturnValue",
+        "nested fixture",
+        "lib/example.ex",
+        2,
+        patch,
+        0
+      )
+
+    %{
+      "version" => 1,
+      "exhaustive" => true,
+      "source_file_count" => 1,
+      "selected_source_file_count" => 1,
+      "source_files" => [
+        %{"path" => "lib/example.ex", "selected" => true, "selection_reason" => "selected"}
+      ],
+      "candidate_count" => 1,
+      "selected_count" => 1,
+      "mutants" => [
+        %{
+          "id" => id,
+          "selected" => true,
+          "selection_reason" => "selected",
+          "mutator" => "Muex.Mutator.ReturnValue",
+          "description" => "nested fixture",
+          "location" => %{"file" => "lib/example.ex", "line" => 2},
+          "target_ordinal" => 0,
+          "patch" => patch,
+          "original_source" => original,
+          "original_sha256" => sha256(original),
+          "mutated_source" => mutated,
+          "mutated_sha256" => sha256(mutated)
+        }
+      ]
     }
   end
 

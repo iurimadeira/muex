@@ -329,8 +329,34 @@ defmodule Muex.Audit.Validator do
 
     original == mutated or
       original
-      |> replacement_candidates(before, after_source)
-      |> Enum.member?(mutated)
+      |> source_indentations()
+      |> Enum.any?(fn indentation ->
+        patch_replaces_source?(
+          original,
+          mutated,
+          indent_snippet(before, indentation),
+          indent_snippet(after_source, indentation)
+        )
+      end)
+  end
+
+  defp patch_replaces_source?(original, mutated, before, after_source) do
+    original
+    |> replacement_candidates(before, after_source)
+    |> Enum.member?(mutated)
+  end
+
+  defp source_indentations(source) do
+    source
+    |> then(&Regex.scan(~r/(?:\A|\n)([ \t]*)(?=\S)/, &1, capture: :all_but_first))
+    |> Enum.map(&hd/1)
+    |> Enum.uniq()
+  end
+
+  defp indent_snippet(snippet, indentation) do
+    snippet
+    |> String.split("\n")
+    |> Enum.map_join("\n", &(indentation <> &1))
   end
 
   defp replacement_candidates(source, before, after_source) do

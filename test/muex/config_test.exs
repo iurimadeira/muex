@@ -26,11 +26,30 @@ defmodule Muex.ConfigTest do
       assert config.tce == false
       assert config.since == nil
       assert config.coverage_guided == false
+      assert config.internal.audit_only == false
+      assert config.internal.audit_plan == nil
       assert Muex.Mutator.Literal in config.mutators
       assert Muex.Mutator.StatementDeletion in config.mutators
       assert Muex.Mutator.ReturnValue in config.mutators
       # 8 original mutators + 10 ported Elixir-specific mutators
       assert length(config.mutators) == 18
+    end
+
+    test "audit-only requires an exact audit plan output" do
+      assert {:error, "--audit-only requires --audit-plan"} =
+               Config.from_args(["--audit-only"])
+
+      assert {:error, "--audit-only requires --audit-plan"} =
+               Config.from_args(["--audit-only", "--audit-plan", ""])
+
+      assert {:error, "--audit-plan requires --audit-only"} =
+               Config.from_args(["--audit-plan", "tmp/inventory.json"])
+
+      assert {:ok, config} =
+               Config.from_args(["--audit-only", "--audit-plan", "tmp/inventory.json"])
+
+      assert config.internal.audit_only
+      assert config.internal.audit_plan == "tmp/inventory.json"
     end
 
     test "parses --files flag" do
