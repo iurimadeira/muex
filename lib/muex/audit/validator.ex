@@ -232,13 +232,13 @@ defmodule Muex.Audit.Validator do
   end
 
   defp validate_mutant_entries(mutants, ids, candidate_count) do
-    renderings = original_renderings(mutants)
+    source_contexts = source_contexts(mutants)
 
     cond do
       Enum.any?(mutants, &(Map.get(&1, "selected") not in [true, false])) ->
         {:error, :plan_invalid_selection}
 
-      Enum.any?(mutants, &(not valid_mutant_entry?(&1, renderings))) ->
+      Enum.any?(mutants, &(not valid_mutant_entry?(&1, source_contexts))) ->
         {:error, :plan_invalid_mutant_entry}
 
       Enum.any?(ids, &(not is_binary(&1) or &1 == "")) ->
@@ -255,29 +255,36 @@ defmodule Muex.Audit.Validator do
     end
   end
 
-  defp valid_mutant_entry?(entry, renderings) do
+  defp valid_mutant_entry?(entry, source_contexts) do
     keys = entry |> Map.keys() |> Enum.sort()
 
     case keys do
       @valid_mutant_keys ->
-        valid_standard_mutant?(entry, renderings)
+        valid_standard_mutant?(entry, source_contexts)
 
       @generation_error_mutant_keys ->
         valid_generation_error_mutant?(entry)
 
       @identical_source_mutant_keys ->
-        valid_identical_source_mutant?(entry, renderings)
+        valid_identical_source_mutant?(entry)
 
       _other ->
         false
     end
   end
 
-  defp valid_standard_mutant?(entry, renderings) do
+  defp valid_standard_mutant?(entry, source_contexts) do
     valid_common_mutant_fields?(entry) and
       valid_source_hash?(entry["mutated_source"], entry["mutated_sha256"]) and
-      patch_matches_sources?(entry, renderings)
+      valid_selection_reason?(entry) and
+      (entry["selected"] == false or patch_matches_sources?(entry, source_contexts))
   end
+
+  defp valid_selection_reason?(%{"selected" => true, "selection_reason" => reason}),
+    do: String.starts_with?(reason, "selected")
+
+  defp valid_selection_reason?(%{"selected" => false, "selection_reason" => reason}),
+    do: String.starts_with?(reason, "excluded")
 
   defp valid_generation_error_mutant?(entry) do
     valid_common_mutant_fields?(entry) and entry["selected"] == false and
@@ -285,11 +292,10 @@ defmodule Muex.Audit.Validator do
       valid_generation_error?(entry["generation_error"])
   end
 
-  defp valid_identical_source_mutant?(entry, renderings) do
+  defp valid_identical_source_mutant?(entry) do
     valid_common_mutant_fields?(entry) and entry["selected"] == false and
       entry["selection_reason"] == "excluded_identical_source" and
       valid_source_hash?(entry["mutated_source"], entry["mutated_sha256"]) and
-      patch_matches_sources?(entry, renderings) and
       valid_generation_exclusion?(entry["generation_exclusion"], entry["mutated_sha256"])
   end
 
@@ -329,12 +335,17 @@ defmodule Muex.Audit.Validator do
   # `original_source` holds the verbatim bytes on disk while `patch` snippets and
   # `mutated_source` are renderings of the mutated AST, so a source that is not
   # already written in its rendered form only reconstructs against that rendering.
-  defp original_renderings(mutants) do
+  defp source_contexts(mutants) do
     mutants
-    |> Enum.map(&{Map.get(&1, "original_source"), source_path(&1)})
-    |> Enum.filter(fn {source, path} -> is_binary(source) and is_binary(path) end)
-    |> Enum.uniq()
-    |> Map.new(fn {source, path} -> {source, [source | rendered_source(source, path)]} end)
+    |> Enum.filter(
+      &(&1["selected"] == true and is_binary(&1["original_source"]) and
+          is_binary(source_path(&1)))
+    )
+    |> Enum.group_by(&{&1["original_source"], source_path(&1)})
+    |> Map.new(fn {{source, path} = key, entries} ->
+      patch_befores = MapSet.new(entries, &get_in(&1, ["patch", "before"]))
+      {key, source_context(source, path, patch_befores)}
+    end)
   end
 
   defp source_path(mutant) do
@@ -344,25 +355,149 @@ defmodule Muex.Audit.Validator do
     end
   end
 
-  defp rendered_source(source, path) do
+  defp source_context(source, path, patch_befores) do
     with {:ok, language} <- Muex.Config.language_for_path(path),
          {:ok, ast} <- language.parse(source),
          {:ok, rendered} <- language.unparse(ast) do
-      [Audit.preserve_line_endings(rendered, source)]
+      %{
+        ast: ast,
+        language: language,
+        patch_paths: index_patch_paths(ast, patch_befores),
+        renderings: [source, Audit.preserve_line_endings(rendered, source)]
+      }
     else
-      _other -> []
+      _other -> %{renderings: [source]}
     end
   end
 
-  defp patch_matches_sources?(entry, renderings) do
+  defp patch_matches_sources?(entry, source_contexts) do
     %{"before" => before, "after" => after_source} = entry["patch"]
     original = entry["original_source"]
     mutated = entry["mutated_source"]
+    context = Map.fetch!(source_contexts, {original, source_path(entry)})
 
     original == mutated or
-      renderings
-      |> Map.fetch!(original)
-      |> Enum.any?(&patch_reconstructs_source?(&1, mutated, before, after_source))
+      context.renderings
+      |> Enum.any?(&patch_reconstructs_source?(&1, mutated, before, after_source)) or
+      contextual_patch_matches_sources?(context, entry)
+  end
+
+  defp contextual_patch_matches_sources?(
+         %{ast: original_ast, language: language, patch_paths: patch_paths},
+         entry
+       ) do
+    %{"before" => before} = entry["patch"]
+
+    patch_paths
+    |> Map.get(before, [])
+    |> Enum.any?(fn path ->
+      original_node = node_at_path(original_ast, path)
+
+      entry
+      |> replacement_asts(original_node, language)
+      |> Enum.any?(fn replacement ->
+        original_ast
+        |> replace_at_path(path, replacement)
+        |> language.unparse()
+        |> Audit.preserve_line_endings(entry["original_source"])
+        |> then(&(&1 == {:ok, entry["mutated_source"]}))
+      end)
+    end)
+  end
+
+  defp contextual_patch_matches_sources?(_context, _entry), do: false
+
+  defp replacement_asts(entry, original_node, language) do
+    parsed =
+      case language.parse(entry["patch"]["after"]) do
+        {:ok, ast} -> [ast]
+        {:error, _reason} -> []
+      end
+
+    case function_call_swap(entry, original_node) do
+      {:ok, ast} -> [ast | parsed]
+      :error -> parsed
+    end
+  end
+
+  defp function_call_swap(
+         %{
+           "mutator" => "Muex.Mutator.FunctionCall",
+           "description" => "FunctionCall: swap arguments" <> _suffix,
+           "patch" => %{"after" => after_source}
+         },
+         {form, meta, [first, second | rest]}
+       ) do
+    swapped = {form, meta, [second, first | rest]}
+    if patch_snippet(swapped) == after_source, do: {:ok, swapped}, else: :error
+  end
+
+  defp function_call_swap(_entry, _original_node), do: :error
+
+  defp index_patch_paths(ast, patch_befores) do
+    index_patch_paths(ast, patch_befores, [], %{})
+  end
+
+  defp index_patch_paths(node, patch_befores, path, paths) do
+    snippet = patch_snippet(node)
+
+    paths =
+      if MapSet.member?(patch_befores, snippet),
+        do: Map.update(paths, snippet, [Enum.reverse(path)], &[Enum.reverse(path) | &1]),
+        else: paths
+
+    index_child_paths(node, patch_befores, path, paths)
+  end
+
+  defp index_child_paths({form, _meta, args}, patch_befores, path, paths) do
+    paths = index_patch_paths(form, patch_befores, [{:tuple, 0} | path], paths)
+    index_patch_paths(args, patch_befores, [{:tuple, 2} | path], paths)
+  end
+
+  defp index_child_paths(tuple, patch_befores, path, paths)
+       when is_tuple(tuple) and tuple_size(tuple) == 2 do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> Enum.reduce(paths, fn {child, index}, acc ->
+      index_patch_paths(child, patch_befores, [{:tuple, index} | path], acc)
+    end)
+  end
+
+  defp index_child_paths(list, patch_befores, path, paths) when is_list(list) do
+    list
+    |> Enum.with_index()
+    |> Enum.reduce(paths, fn {child, index}, acc ->
+      index_patch_paths(child, patch_befores, [{:list, index} | path], acc)
+    end)
+  end
+
+  defp index_child_paths(_leaf, _patch_befores, _path, paths), do: paths
+
+  defp patch_snippet(ast) do
+    Macro.to_string(ast)
+  rescue
+    _error -> inspect(ast)
+  end
+
+  defp node_at_path(node, []), do: node
+
+  defp node_at_path(tuple, [{:tuple, index} | path]) do
+    node_at_path(elem(tuple, index), path)
+  end
+
+  defp node_at_path(list, [{:list, index} | path]) do
+    node_at_path(Enum.at(list, index), path)
+  end
+
+  defp replace_at_path(_node, [], replacement), do: replacement
+
+  defp replace_at_path(tuple, [{:tuple, index} | path], replacement) do
+    put_elem(tuple, index, replace_at_path(elem(tuple, index), path, replacement))
+  end
+
+  defp replace_at_path(list, [{:list, index} | path], replacement) do
+    List.update_at(list, index, &replace_at_path(&1, path, replacement))
   end
 
   defp patch_reconstructs_source?(original, mutated, before, after_source) do
