@@ -1004,7 +1004,7 @@ defmodule Muex.HardeningTest do
     assert reasons == %{
              "first" => "selected_by_mutant_ids_file",
              "second" => "selected_by_mutant_ids_file",
-             "third" => "not_selected_by_mutant_ids_file"
+             "third" => "excluded_by_mutant_ids_file"
            }
 
     File.write!(ids_file, "first\nfirst\n")
@@ -1016,6 +1016,59 @@ defmodule Muex.HardeningTest do
 
     assert {:error, "unknown mutant ids: missing"} =
              Muex.select_mutations_by_ids(mutations, ids_file)
+  end
+
+  @tag :tmp_dir
+  test "continuation plans validate selected and unrequested mutation reasons", %{
+    tmp_dir: tmp_dir
+  } do
+    project = mutation_fixture!(tmp_dir)
+    inventory_plan = Path.join(tmp_dir, "inventory-plan.json")
+    continuation_plan = Path.join(tmp_dir, "continuation-plan.json")
+    ids_file = Path.join(tmp_dir, "mutant-ids.txt")
+
+    config = fn plan, extra_opts ->
+      Muex.Config.from_opts(
+        [
+          files: Path.join(project, "lib/example.ex"),
+          project_root: project,
+          test_paths: "test",
+          mutators: "literal",
+          no_filter: true,
+          no_optimize: true,
+          audit_only: true,
+          audit_plan: plan
+        ] ++ extra_opts
+      )
+    end
+
+    assert {:ok, inventory_config} = config.(inventory_plan, [])
+    assert {:ok, %{selected_count: 2}} = Muex.run(inventory_config)
+
+    [selected | _unrequested] = Jason.decode!(File.read!(inventory_plan))["mutants"]
+    File.write!(ids_file, selected["id"] <> "\n")
+
+    assert {:ok, continuation_config} =
+             config.(continuation_plan, mutant_ids_file: ids_file)
+
+    assert {:ok, %{selected_count: 1}} = Muex.run(continuation_config)
+
+    assert {:ok, %{selected_ids: [selected_id]}} =
+             Validator.validate_plan_file(continuation_plan)
+
+    assert selected_id == selected["id"]
+
+    reasons =
+      continuation_plan
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.fetch!("mutants")
+      |> Map.new(&{&1["selected"], &1["selection_reason"]})
+
+    assert reasons == %{
+             true => "selected_by_mutant_ids_file",
+             false => "excluded_by_mutant_ids_file"
+           }
   end
 
   test "continuation proves imported, blocked, and pending partition the parent plan" do

@@ -222,12 +222,21 @@ defmodule Muex.Sandbox do
 
   @doc false
   def rebuild(sandbox, file_paths, test_paths) do
-    with :ok <- validate_private_root(sandbox) do
+    with :ok <- validate_private_root(sandbox),
+         auxiliary_paths <-
+           validate_auxiliary_paths!(sandbox.project_root, Map.get(sandbox, :auxiliary_paths, [])),
+         :ok <- unseal_auxiliary_paths(sandbox),
+         :ok <- validate_private_root(sandbox) do
       File.rm_rf!(sandbox.root)
 
       rebuilt =
         sandbox.root
-        |> create_sandbox(sandbox.project_root, sandbox.build_env, test_paths)
+        |> do_create_sandbox(
+          sandbox.project_root,
+          sandbox.build_env,
+          test_paths,
+          auxiliary_paths
+        )
         |> Map.put(:owner_token, sandbox.owner_token)
 
       with :ok <- prepare(rebuilt, file_paths), do: {:ok, rebuilt}

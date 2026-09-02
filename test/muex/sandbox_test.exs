@@ -212,6 +212,44 @@ defmodule Muex.SandboxTest do
       assert File.read!(Path.join(project_root, "runtime.json")) == "{}"
     end
 
+    test "rebuild replaces sealed auxiliary snapshots without losing them" do
+      project_root =
+        Path.join(System.tmp_dir!(), "muex_test_project_#{System.system_time(:microsecond)}")
+
+      File.mkdir_p!(Path.join(project_root, "bin"))
+      File.write!(Path.join(project_root, "mix.exs"), "# fake mix.exs")
+      File.write!(Path.join(project_root, "bin/helper"), "first")
+
+      on_exit(fn -> File.rm_rf!(project_root) end)
+
+      [sandbox] =
+        Sandbox.create_pool(1,
+          project_root: project_root,
+          test_paths: [],
+          auxiliary_paths: ["bin"]
+        )
+
+      File.write!(Path.join(project_root, "bin/helper"), "second")
+
+      assert {:ok, rebuilt} = Sandbox.rebuild(sandbox, [], [])
+      on_exit(fn -> Sandbox.cleanup([rebuilt]) end)
+
+      assert rebuilt.auxiliary_paths == ["bin"]
+      assert File.read!(Path.join(rebuilt.root, "bin/helper")) == "second"
+
+      assert {:error, :eacces} =
+               File.write(Path.join(rebuilt.root, "bin/helper"), "sandbox changed")
+
+      File.rm!(Path.join(project_root, "bin/helper"))
+      File.ln_s!(Path.join(project_root, "mix.exs"), Path.join(project_root, "bin/helper"))
+
+      assert_raise ArgumentError, ~r/unsafe auxiliary project path/, fn ->
+        Sandbox.rebuild(rebuilt, [], [])
+      end
+
+      assert File.read!(Path.join(rebuilt.root, "bin/helper")) == "second"
+    end
+
     test "rejects unsafe, missing, and symlinked auxiliary paths" do
       project_root =
         Path.join(System.tmp_dir!(), "muex_test_project_#{System.system_time(:microsecond)}")

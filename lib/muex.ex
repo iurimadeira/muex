@@ -404,7 +404,7 @@ defmodule Muex do
             reason =
               if MapSet.member?(selected_ids, mutation.id),
                 do: "selected_by_mutant_id",
-                else: "not_selected_by_mutant_id"
+                else: "excluded_by_mutant_id"
 
             {mutation.id, reason}
           end)
@@ -466,7 +466,7 @@ defmodule Muex do
                 reason =
                   if MapSet.member?(unique_ids, mutation.id),
                     do: "selected_by_mutant_ids_file",
-                    else: "not_selected_by_mutant_ids_file"
+                    else: "excluded_by_mutant_ids_file"
 
                 {mutation.id, reason}
               end)
