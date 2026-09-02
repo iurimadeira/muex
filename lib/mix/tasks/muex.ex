@@ -57,6 +57,8 @@ defmodule Mix.Tasks.Muex do
       campaign-owned coverage index instead of measuring coverage in-process;
       the index requires `--coverage-guided` and the fingerprint requires the
       index
+    * `--auxiliary-paths-file` - Newline-delimited project-relative files or
+      directories copied read-only into every mutation sandbox
     * `--changed-diff-file` - Supply the `--since` diff as a file
     * `--mutator-paths` - Comma-separated directories of custom mutator modules
 

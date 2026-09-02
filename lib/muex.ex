@@ -650,7 +650,8 @@ defmodule Muex do
           project_root,
           Map.keys(file_to_module),
           test_files,
-          System.get_env("MUEX_COVERAGE_MODULES_FILE")
+          System.get_env("MUEX_COVERAGE_MODULES_FILE"),
+          config.internal.auxiliary_paths
         )
 
     case Muex.Coverage.read_bound_index(path, expected) do
@@ -672,6 +673,7 @@ defmodule Muex do
     Muex.Coverage.collect(test_files, file_to_module,
       cd: config.project_root,
       test_paths: test_paths,
+      auxiliary_paths: config.internal.auxiliary_paths,
       output: output
     )
   end
@@ -717,6 +719,7 @@ defmodule Muex do
                  project_root: config.project_root,
                  tce: config.tce,
                  coverage_index: coverage_index,
+                 auxiliary_paths: config.internal.auxiliary_paths,
                  baseline_mutations: all_mutations,
                  checkpoint: checkpoint,
                  audit_dir: config.audit_dir
@@ -759,6 +762,15 @@ defmodule Muex do
             end
           end
         ) ++
+        Enum.flat_map(config.internal.auxiliary_paths, fn relative ->
+          path = Path.join(config.project_root, relative)
+
+          cond do
+            File.regular?(path) -> [path]
+            File.dir?(path) -> Path.wildcard(Path.join(path, "**/*"), match_dot: true)
+            true -> []
+          end
+        end) ++
         Enum.map(~w(mix.exs mix.lock), &Path.join(config.project_root, &1))
 
     config_term =

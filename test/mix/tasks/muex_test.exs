@@ -3,6 +3,11 @@ defmodule Mix.Tasks.MuexTest do
 
   alias Mix.Tasks.Muex, as: MuexTask
 
+  test "documents the public auxiliary sandbox path option" do
+    assert {:docs_v1, _, _, _, %{"en" => task_doc}, _, _} = Code.fetch_docs(MuexTask)
+    assert task_doc =~ "--auxiliary-paths-file"
+  end
+
   test "mix muex raises when zero mutations are tested and fail_at is not met" do
     # When files list matches no mutable code or empty directory, run returns results: []
     # If fail-at 80 is set, it should raise a Mix.Error instead of passing silently.

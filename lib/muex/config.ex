@@ -86,6 +86,8 @@ defmodule Muex.Config do
       campaign-owned coverage index instead of measuring coverage in-process;
       the index requires `--coverage-guided` and the fingerprint requires the
       index
+    * `--auxiliary-paths-file` - Newline-delimited project-relative files or
+      directories required by shard tests; copied read-only into each sandbox
     * `--changed-diff-file` - Supply the `--since` diff as a file instead of
       shelling out to git
     * `--preset` - Framework preset that prunes noisy DSL calls: `phoenix`,
@@ -205,6 +207,7 @@ defmodule Muex.Config do
                coverage_guided: :boolean,
                coverage_index_file: :string,
                coverage_corpus_fingerprint: :string,
+               auxiliary_paths_file: :string,
                optimize_level: :string,
                min_complexity: :integer,
                max_per_function: :integer,
@@ -255,7 +258,8 @@ defmodule Muex.Config do
          :ok <- validate_inventory_cache(opts),
          :ok <- validate_audit_only(opts),
          :ok <- validate_mutant_selection(opts),
-         :ok <- validate_tce_disabled(opts) do
+         :ok <- validate_tce_disabled(opts),
+         {:ok, auxiliary_paths} <- read_auxiliary_paths(opts) do
       config = %__MODULE__{
         files: files,
         test_paths: resolve_test_paths(opts, app),
@@ -268,6 +272,7 @@ defmodule Muex.Config do
           checkpoint: Keyword.get(opts, :checkpoint),
           coverage_index_file: Keyword.get(opts, :coverage_index_file),
           coverage_corpus_fingerprint: Keyword.get(opts, :coverage_corpus_fingerprint),
+          auxiliary_paths: auxiliary_paths,
           inventory_cache_file: Keyword.get(opts, :inventory_cache_file),
           inventory_cache_key: Keyword.get(opts, :inventory_cache_key)
         },
@@ -493,6 +498,28 @@ defmodule Muex.Config do
     if Keyword.get(opts, :tce, false),
       do: {:error, "--tce is disabled because compiler-equivalence detection is not sound"},
       else: :ok
+  end
+
+  defp read_auxiliary_paths(opts) do
+    case Keyword.get(opts, :auxiliary_paths_file) do
+      nil ->
+        {:ok, []}
+
+      path ->
+        case File.read(path) do
+          {:ok, contents} ->
+            paths =
+              contents
+              |> String.split("\n")
+              |> Enum.map(&String.trim/1)
+              |> Enum.reject(&(&1 == ""))
+
+            {:ok, paths}
+
+          {:error, reason} ->
+            {:error, "cannot read auxiliary paths file: #{:file.format_error(reason)}"}
+        end
+    end
   end
 
   defp parse_mutator_paths(nil), do: []

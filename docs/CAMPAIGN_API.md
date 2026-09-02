@@ -109,8 +109,14 @@ mix muex --project-root . \
   --campaign-fingerprint "$GLOBAL_FINGERPRINT" \
   --inventory-cache-file inventory-cache/shard-1.etf \
   --inventory-cache-key "$INVENTORY_KEY" \
+  --auxiliary-paths-file auxiliary.txt \
   --format json --report-file invocation.a1/shard-1.json
 ```
+
+`--auxiliary-paths-file` uses the same validated project-relative snapshot
+contract as coverage export. Muex copies each listed file or directory read-only
+into every shard sandbox, including the baseline run, and binds its bytes into
+the checkpoint fingerprint.
 
 The checkpoint is append-only JSONL and is the resume point: re-running the shard
 skips every mutation already recorded there. Give each attempt its own
@@ -315,7 +321,8 @@ mix muex --project-root . \
   ... \
   --coverage-guided \
   --coverage-index-file coverage.etf \
-  --coverage-corpus-fingerprint "$(jq -r .coverage.corpus_fingerprint campaign.json)"
+  --coverage-corpus-fingerprint "$(jq -r .coverage.corpus_fingerprint campaign.json)" \
+  --auxiliary-paths-file auxiliary.txt
 ```
 
 `--coverage-index-file` requires `--coverage-guided`, and

@@ -241,7 +241,8 @@ defmodule Muex.WorkerPool do
       sandboxes =
         Sandbox.create_pool(state.max_workers,
           project_root: project_root,
-          test_paths: baseline_test_paths
+          test_paths: baseline_test_paths,
+          auxiliary_paths: Keyword.get(opts, :auxiliary_paths, [])
         )
 
       case prepare_and_baseline(sandboxes, mutations, baseline_test_paths, project_root, opts) do

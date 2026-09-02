@@ -529,7 +529,9 @@ defmodule Muex.HardeningTest do
 
     report_file = Path.join(tmp_dir, "report.json")
     audit_dir = Path.join(tmp_dir, "audit")
+    auxiliary_paths_file = Path.join(tmp_dir, "auxiliary-paths.txt")
     campaign_fingerprint = String.duplicate("f", 64)
+    File.write!(auxiliary_paths_file, "CONTEXT-MAP.md\ndocs\n")
 
     assert {:ok, config} =
              Muex.Config.from_args([
@@ -544,7 +546,9 @@ defmodule Muex.HardeningTest do
                "--mutant-id",
                "abc123",
                "--campaign-fingerprint",
-               campaign_fingerprint
+               campaign_fingerprint,
+               "--auxiliary-paths-file",
+               auxiliary_paths_file
              ])
 
     assert config.report_file == report_file
@@ -552,6 +556,13 @@ defmodule Muex.HardeningTest do
     assert config.baseline_timeout_ms == 60_000
     assert config.mutant_id == "abc123"
     assert config.campaign_fingerprint == campaign_fingerprint
+    assert config.internal.auxiliary_paths == ["CONTEXT-MAP.md", "docs"]
+
+    assert {:error, "cannot read auxiliary paths file: no such file or directory"} =
+             Muex.Config.from_args([
+               "--auxiliary-paths-file",
+               Path.join(tmp_dir, "missing-auxiliary-paths.txt")
+             ])
 
     assert {:error, "--tce is disabled because compiler-equivalence detection is not sound"} =
              Muex.Config.from_args(["--tce"])
@@ -1666,6 +1677,68 @@ defmodule Muex.HardeningTest do
   end
 
   @tag :tmp_dir
+  test "worker baselines materialize configured auxiliary project paths", %{tmp_dir: tmp_dir} do
+    project = mutation_fixture!(tmp_dir)
+    File.mkdir_p!(Path.join(project, "docs"))
+    File.write!(Path.join(project, "CONTEXT-MAP.md"), "context\n")
+    File.write!(Path.join(project, "docs/runtime-value"), "available\n")
+
+    body = """
+    if [ "${1:-}" = compile ]; then exit 0; fi
+    test "$(cat CONTEXT-MAP.md)" = context || exit 23
+    test "$(cat docs/runtime-value)" = available || exit 24
+    printf 'MUEX_EXUNIT_RESULT:%s:{"tests":1,"failures":0}\n' "$MUEX_EXUNIT_RESULT_NONCE"
+    """
+
+    with_fake_mix(tmp_dir, body, fn ->
+      assert {:ok, [%{result: :no_op}]} =
+               Runner.run_all_result(
+                 [mutation()],
+                 %{"lib/example.ex" => file_entry()},
+                 ElixirLanguage,
+                 %{},
+                 %{"lib/example.ex" => Example},
+                 max_workers: 1,
+                 project_root: project,
+                 test_paths: [Path.join(project, "test/example_test.exs")],
+                 auxiliary_paths: ["CONTEXT-MAP.md", "docs"],
+                 tce: false
+               )
+    end)
+  end
+
+  @tag :tmp_dir
+  test "Muex propagates the public auxiliary paths file into mutation sandboxes", %{
+    tmp_dir: tmp_dir
+  } do
+    project = mutation_fixture!(tmp_dir)
+    File.write!(Path.join(project, "CONTEXT-MAP.md"), "context\n")
+    paths_file = Path.join(tmp_dir, "auxiliary-paths.txt")
+    File.write!(paths_file, "CONTEXT-MAP.md\n")
+
+    assert {:ok, config} =
+             Muex.Config.from_opts(
+               files: Path.join(project, "lib/example.ex"),
+               project_root: project,
+               test_paths: Path.join(project, "test/example_test.exs"),
+               mutators: "literal",
+               no_filter: true,
+               no_optimize: true,
+               auxiliary_paths_file: paths_file
+             )
+
+    body = """
+    if [ "${1:-}" = compile ]; then exit 0; fi
+    test "$(cat CONTEXT-MAP.md)" = context || exit 23
+    printf 'MUEX_EXUNIT_RESULT:%s:{"tests":1,"failures":0}\n' "$MUEX_EXUNIT_RESULT_NONCE"
+    """
+
+    with_fake_mix(tmp_dir, body, fn ->
+      assert {:ok, %{results: [_ | _]}} = Muex.run(config)
+    end)
+  end
+
+  @tag :tmp_dir
   test "default mutation runs the full declared test corpus despite dependency hints", %{
     tmp_dir: tmp_dir
   } do
@@ -2537,6 +2610,35 @@ defmodule Muex.HardeningTest do
 
     after_change = Muex.checkpoint_metadata(config, files, tests)
     refute before.run == after_change.run
+  end
+
+  @tag :tmp_dir
+  test "resume fingerprint binds configured auxiliary path bytes", %{tmp_dir: tmp_dir} do
+    File.mkdir_p!(Path.join(tmp_dir, "lib"))
+    File.mkdir_p!(Path.join(tmp_dir, "test"))
+    File.mkdir_p!(Path.join(tmp_dir, "credo_checks"))
+    File.write!(Path.join(tmp_dir, "lib/example.ex"), "defmodule Example do\nend\n")
+    File.write!(Path.join(tmp_dir, "test/example_test.exs"), "")
+    auxiliary = Path.join(tmp_dir, "credo_checks/custom.ex")
+    File.write!(auxiliary, "one\n")
+    paths_file = Path.join(tmp_dir, "auxiliary-paths.txt")
+    File.write!(paths_file, "credo_checks\n")
+
+    assert {:ok, config} =
+             Muex.Config.from_opts(
+               files: "lib/example.ex",
+               test_paths: "test",
+               project_root: tmp_dir,
+               auxiliary_paths_file: paths_file
+             )
+
+    files = [%{path: "lib/example.ex"}]
+    tests = [Path.join(tmp_dir, "test/example_test.exs")]
+    before = Muex.checkpoint_metadata(config, files, tests)
+
+    File.write!(auxiliary, "two\n")
+
+    refute before.run == Muex.checkpoint_metadata(config, files, tests).run
   end
 
   @tag :tmp_dir
