@@ -4,6 +4,7 @@ defmodule Muex.HardeningTest do
   import ExUnit.CaptureIO
 
   alias Muex.Audit
+  alias Muex.Audit.Validator
   alias Muex.Checkpoint
   alias Muex.Compiler
   alias Muex.Config
@@ -2746,6 +2747,110 @@ defmodule Muex.HardeningTest do
     assert header["total"] == 0
     assert header["campaign_fingerprint"] == "campaign"
     assert report |> File.read!() |> Jason.decode!() |> get_in(["summary", "total"]) == 0
+  end
+
+  @tag :tmp_dir
+  test "an empty shard publishes and resumes a complete validated artifact set", %{
+    tmp_dir: tmp_dir
+  } do
+    files = Path.join(tmp_dir, "lib/missing-shard.ex")
+    cache = Path.join(tmp_dir, "inventory/shard-42.etf")
+    cached_plan = Path.rootname(cache, ".etf") <> ".plan.json"
+    checkpoint = Path.join(tmp_dir, "shard-42.checkpoint.jsonl")
+    cache_key = String.duplicate("a", 64)
+    campaign_fingerprint = String.duplicate("b", 64)
+
+    run = fn name ->
+      audit = Path.join(tmp_dir, name)
+      report = Path.join(audit, "report.json")
+
+      assert {:ok, config} =
+               Muex.Config.from_args([
+                 "--files",
+                 files,
+                 "--project-root",
+                 tmp_dir,
+                 "--test-paths",
+                 "test",
+                 "--no-filter",
+                 "--audit-dir",
+                 audit,
+                 "--checkpoint",
+                 checkpoint,
+                 "--report-file",
+                 report,
+                 "--format",
+                 "json",
+                 "--inventory-cache-file",
+                 cache,
+                 "--inventory-cache-key",
+                 cache_key,
+                 "--campaign-fingerprint",
+                 campaign_fingerprint
+               ])
+
+      assert {:ok, %{results: []} = result} = Muex.run(config)
+      assert result.score_low == 0.0
+      assert result.score_high == 0.0
+      {audit, report}
+    end
+
+    validate = fn audit, report, output ->
+      plan = Path.join(audit, "plan.json")
+
+      assert %{
+               "candidate_count" => 0,
+               "exhaustive" => true,
+               "mutants" => [],
+               "selected_count" => 0,
+               "selected_source_file_count" => 0,
+               "source_file_count" => 0,
+               "source_files" => []
+             } = Jason.decode!(File.read!(plan))
+
+      assert %{"mutations" => [], "summary" => %{"total" => 0}} =
+               Jason.decode!(File.read!(report))
+
+      assert {:ok, %{selected_count: 0, result_count: 0}} =
+               Validator.validate(
+                 plan: plan,
+                 checkpoint: checkpoint,
+                 report: report,
+                 artifact_roots: [audit],
+                 campaign_fingerprint: campaign_fingerprint,
+                 output: output
+               )
+
+      assert File.regular?(output)
+    end
+
+    {first_audit, first_report} = run.("first-audit")
+    assert File.regular?(cache)
+    assert File.regular?(cached_plan)
+
+    assert %{"status" => "miss", "selected_count" => 0, "cache_key" => ^cache_key} =
+             first_audit
+             |> Path.join("inventory-cache.json")
+             |> File.read!()
+             |> Jason.decode!()
+
+    assert [%{"type" => "header", "total" => 0, "campaign_fingerprint" => ^campaign_fingerprint}] =
+             checkpoint |> File.stream!() |> Enum.map(&Jason.decode!/1)
+
+    validate.(first_audit, first_report, Path.join(first_audit, "validation.json"))
+    checkpoint_bytes = File.read!(checkpoint)
+
+    {second_audit, second_report} = run.("second-audit")
+
+    assert %{"status" => "hit", "selected_count" => 0, "cache_key" => ^cache_key} =
+             second_audit
+             |> Path.join("inventory-cache.json")
+             |> File.read!()
+             |> Jason.decode!()
+
+    assert File.read!(checkpoint) == checkpoint_bytes
+    assert File.read!(Path.join(second_audit, "plan.json")) == File.read!(cached_plan)
+    validate.(second_audit, second_report, Path.join(second_audit, "validation.json"))
   end
 
   @tag :tmp_dir

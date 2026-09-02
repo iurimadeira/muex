@@ -84,11 +84,8 @@ defmodule Muex do
     log("Loading files from #{Enum.join(config.files, ", ")}...", config.verbose)
 
     case Muex.Loader.load_all(config.files, config.language) do
-      {:ok, []} when config.internal.audit_only ->
-        do_run(config, [])
-
       {:ok, []} ->
-        {:ok, %{results: [], score_low: 0.0, score_high: 0.0}}
+        do_run(config, [])
 
       {:ok, [_ | _] = all_files} ->
         # Normalize file paths to be relative to the project root so that
