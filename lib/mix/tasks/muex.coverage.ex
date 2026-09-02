@@ -21,7 +21,8 @@ defmodule Mix.Tasks.Muex.Coverage do
 
       mix muex.coverage export --project-root . \\
         --source-files sources.txt --test-files part-1.txt \\
-        --corpus-test-files tests.txt --partition 1 \\
+        --corpus-test-files tests.txt --auxiliary-paths-file auxiliary.txt \\
+        --partition 1 \\
         --index part-1.etf --audit-dir audit/part-1
 
   `merge` joins partition indexes into one index and manifest, and `validate`
@@ -41,7 +42,10 @@ defmodule Mix.Tasks.Muex.Coverage do
   ## Inputs
 
   Every path option is read as given; newline-delimited list files ignore blank
-  lines. `MUEX_COVERAGE_MODULES_FILE` selects the manifest written by
+  lines. `--auxiliary-paths-file` lists explicit project-relative existing
+  roots/files needed by tests inside the coverage sandbox. The same list must
+  be passed to `mix muex.campaign build`. `MUEX_COVERAGE_MODULES_FILE` selects
+  the manifest written by
   `manifest`: `export` instruments exactly its modules and folds the file into
   the index's `corpus_fingerprint`. Leaving it unset makes `export` load the
   sources itself and fingerprint without a selective manifest, so it must be
@@ -76,7 +80,8 @@ defmodule Mix.Tasks.Muex.Coverage do
     manifest: :string,
     audit_dir: :string,
     partition: :integer,
-    output: :string
+    output: :string,
+    auxiliary_paths_file: :string
   ]
 
   @impl Mix.Task
@@ -100,6 +105,7 @@ defmodule Mix.Tasks.Muex.Coverage do
     source_files = read_lines(Keyword.fetch!(opts, :source_files))
     relative_tests = read_lines(Keyword.fetch!(opts, :test_files))
     corpus_tests = read_lines(Keyword.fetch!(opts, :corpus_test_files))
+    auxiliary_paths = read_optional_lines(opts[:auxiliary_paths_file])
     test_files = Enum.map(relative_tests, &Path.expand(&1, root))
     corpus_test_files = Enum.map(corpus_tests, &Path.expand(&1, root))
 
@@ -111,6 +117,7 @@ defmodule Mix.Tasks.Muex.Coverage do
       Coverage.collect(test_files, file_to_module,
         cd: root,
         test_paths: [Path.join(root, "test")],
+        auxiliary_paths: auxiliary_paths,
         output: audit_dir
       )
 
@@ -123,7 +130,8 @@ defmodule Mix.Tasks.Muex.Coverage do
         root,
         source_files,
         corpus_test_files,
-        System.get_env("MUEX_COVERAGE_MODULES_FILE")
+        System.get_env("MUEX_COVERAGE_MODULES_FILE"),
+        auxiliary_paths
       )
 
     write_json!(index_path <> ".manifest.json", %{
@@ -312,6 +320,9 @@ defmodule Mix.Tasks.Muex.Coverage do
     |> Enum.map(&String.trim_trailing/1)
     |> Enum.reject(&(&1 == ""))
   end
+
+  defp read_optional_lines(nil), do: []
+  defp read_optional_lines(path), do: read_lines(path)
 
   defp evidence(dir) do
     dir

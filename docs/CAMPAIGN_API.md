@@ -214,6 +214,7 @@ export MUEX_COVERAGE_MODULES_FILE=selective.json
 mix muex.coverage export --project-root . \
   --source-files sources.txt \
   --test-files part-1.txt --corpus-test-files tests.txt \
+  --auxiliary-paths-file auxiliary.txt \
   --partition 1 --index coverage/part-1.etf --audit-dir audit/part-1
 ```
 
@@ -221,6 +222,11 @@ mix muex.coverage export --project-root . \
 whole campaign corpus, so every partition agrees on the same
 `corpus_fingerprint`. `--audit-dir` receives the raw `.coverdata` exports, and
 their paths, sizes, and digests are recorded as the partition's `evidence`.
+`--auxiliary-paths-file` is optional. Each nonblank line names an explicit
+project-relative existing file or directory that tests need inside the private
+coverage sandbox. Traversal, absolute paths, missing paths, symlinks, and
+special files are rejected. The listed names and complete contents participate
+in the corpus fingerprint.
 
 ### 3. Merge and validate
 
@@ -253,13 +259,15 @@ binds the index later, so keep the pair together.
 mix muex.campaign build --project-root . \
   --audit-plan inventory.json \
   --source-files sources.txt --test-files tests.txt \
+  --auxiliary-paths-file auxiliary.txt \
   --config-file config.json \
   --coverage-index coverage.etf --selective-manifest selective.json \
   --shards 4 --commit-sha "$SHA" --output campaign.json
 ```
 
 Build recomputes the corpus fingerprint from `--project-root`,
-`--source-files`, `--test-files` and `--selective-manifest`, then reads the
+`--source-files`, `--test-files`, `--auxiliary-paths-file`, and
+`--selective-manifest`, then reads the
 index only if `coverage.etf.manifest.json` declares `version` 1, that exact
 `corpus_fingerprint`, and an `index_sha256` equal to the index's own digest.
 The plan records the binding as
@@ -276,6 +284,8 @@ to the full test corpus.
 `--selective-manifest` must name the same file `MUEX_COVERAGE_MODULES_FILE`
 named during export. Setting it in one place and not the other changes the
 fingerprint and silently costs the campaign its coverage.
+Likewise, coverage export and campaign build must receive the same auxiliary
+path list; changing any listed path or its contents makes the index stale.
 
 ### 5. Resolving the binding per shard
 

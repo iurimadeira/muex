@@ -22,7 +22,8 @@ defmodule Mix.Tasks.Muex.Campaign do
     plan: :string,
     plan_sha256: :string,
     shard: :integer,
-    output: :string
+    output: :string,
+    auxiliary_paths_file: :string
   ]
 
   @impl Mix.Task
@@ -68,6 +69,7 @@ defmodule Mix.Tasks.Muex.Campaign do
          root = opts |> Keyword.fetch!(:project_root) |> Path.expand(),
          source_files = read_lines(Keyword.fetch!(opts, :source_files)),
          test_files = read_lines(Keyword.fetch!(opts, :test_files)),
+         auxiliary_paths = read_optional_lines(opts[:auxiliary_paths_file]),
          {:ok, config} <- read_json(Keyword.fetch!(opts, :config_file)),
          {:ok, inventory} <-
            read_inventory(root, Keyword.fetch!(opts, :audit_plan), source_files, config),
@@ -76,7 +78,8 @@ defmodule Mix.Tasks.Muex.Campaign do
              root,
              source_files,
              test_files,
-             Keyword.get(opts, :selective_manifest)
+             Keyword.get(opts, :selective_manifest),
+             auxiliary_paths
            ),
          {coverage, coverage_sha256} <-
            read_coverage(Keyword.get(opts, :coverage_index), coverage_fingerprint),
@@ -185,6 +188,9 @@ defmodule Mix.Tasks.Muex.Campaign do
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
   end
+
+  defp read_optional_lines(nil), do: []
+  defp read_optional_lines(path), do: read_lines(path)
 
   defp sha256(contents) do
     :sha256

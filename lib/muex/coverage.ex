@@ -95,18 +95,29 @@ defmodule Muex.Coverage do
   end
 
   @doc false
-  def corpus_fingerprint(project_root, source_files, test_files, selective_manifest \\ nil) do
+  def corpus_fingerprint(
+        project_root,
+        source_files,
+        test_files,
+        selective_manifest \\ nil,
+        auxiliary_paths \\ []
+      ) do
     root = Path.expand(project_root)
+    auxiliary = fingerprint_auxiliary_paths(root, auxiliary_paths)
 
-    digest({
-      "muex-coverage-corpus-v1",
+    common = {
       fingerprint_files(root, source_files),
       fingerprint_files(root, test_files),
       fingerprint_optional_file(selective_manifest),
       System.version(),
       :erlang.system_info(:otp_release),
       Application.spec(:muex, :vsn)
-    })
+    }
+
+    case auxiliary do
+      [] -> digest(Tuple.insert_at(common, 0, "muex-coverage-corpus-v1"))
+      entries -> digest({"muex-coverage-corpus-v2", common, entries})
+    end
   end
 
   @doc "Records that `test_file` executes `line` of `file`."
@@ -216,6 +227,30 @@ defmodule Muex.Coverage do
   defp fingerprint_optional_file(""), do: nil
   defp fingerprint_optional_file(path), do: sha256_file(path)
 
+  defp fingerprint_auxiliary_paths(root, paths) do
+    root
+    |> Sandbox.validate_auxiliary_paths!(paths)
+    |> Enum.map(fn relative ->
+      path = Path.join(root, relative)
+      {relative, fingerprint_auxiliary_tree(path, root)}
+    end)
+  end
+
+  defp fingerprint_auxiliary_tree(path, root) do
+    case File.lstat!(path) do
+      %File.Stat{type: :regular} ->
+        [{Path.relative_to(path, root), sha256_file(path)}]
+
+      %File.Stat{type: :directory} ->
+        children = path |> File.ls!() |> Enum.sort()
+
+        [
+          {Path.relative_to(path, root), :directory}
+          | Enum.flat_map(children, &fingerprint_auxiliary_tree(Path.join(path, &1), root))
+        ]
+    end
+  end
+
   defp sha256_file(path) do
     case File.read(path) do
       {:ok, bytes} -> sha256(bytes)
@@ -244,14 +279,15 @@ defmodule Muex.Coverage do
   batch. This can select extra tests for a mutant, but cannot omit a test on the
   strength of unavailable per-test attribution. Returns a `t()` index.
 
-  Options: `:cd` (project root, default `File.cwd!/0`), `:test_paths`
-  (paths mirrored into the private sandbox), and `:output` (persistent
-  coverage evidence directory).
+  Options: `:cd` (project root, default `File.cwd!/0`), `:test_paths`,
+  `:auxiliary_paths` (explicit project-relative roots/files mirrored into the
+  private sandbox), and `:output` (persistent coverage evidence directory).
   """
   @spec collect([Path.t()], %{Path.t() => module()}, keyword()) :: t()
   def collect(test_files, file_to_module, opts \\ []) do
     project_root = opts |> Keyword.get(:cd, File.cwd!()) |> Path.expand()
     test_paths = Keyword.get(opts, :test_paths, [Path.join(project_root, "test")])
+    auxiliary_paths = Keyword.get(opts, :auxiliary_paths, [])
     output = persistent_output(opts[:output])
     module_to_path = invert(file_to_module)
     ensure_cover_started()
@@ -268,7 +304,8 @@ defmodule Muex.Coverage do
       sandboxes =
       Sandbox.create_pool(1,
         project_root: project_root,
-        test_paths: Enum.uniq(sandbox_test_paths)
+        test_paths: Enum.uniq(sandbox_test_paths),
+        auxiliary_paths: auxiliary_paths
       )
 
     try do

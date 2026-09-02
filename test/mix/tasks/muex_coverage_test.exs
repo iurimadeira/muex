@@ -13,6 +13,7 @@ defmodule Mix.Tasks.Muex.CoverageTest do
     assert {:docs_v1, _, _, _, %{"en" => task_doc}, _, _} = Code.fetch_docs(CoverageTask)
     assert task_doc =~ "docs/CAMPAIGN_API.md"
     assert task_doc =~ "MUEX_COVERAGE_MODULES_FILE"
+    assert task_doc =~ "--auxiliary-paths-file"
 
     assert {:docs_v1, _, _, _, %{"en" => tool_doc}, _, tool_docs} = Code.fetch_docs(SelectiveTool)
     assert tool_doc =~ "test_coverage: [tool: Muex.Coverage.SelectiveTool]"

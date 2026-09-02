@@ -38,9 +38,12 @@ defmodule Muex.Sandbox do
   """
   @spec create_pool(non_neg_integer(), keyword()) :: [sandbox()]
   def create_pool(count, opts \\ []) do
-    project_root = Keyword.get(opts, :project_root, File.cwd!())
+    project_root = opts |> Keyword.get(:project_root, File.cwd!()) |> Path.expand()
     build_env = Keyword.get(opts, :build_env, "test")
     test_paths = Keyword.get(opts, :test_paths, ["test"])
+
+    auxiliary_paths =
+      validate_auxiliary_paths!(project_root, Keyword.get(opts, :auxiliary_paths, []))
 
     unique = System.unique_integer([:positive, :monotonic])
 
@@ -55,9 +58,23 @@ defmodule Muex.Sandbox do
       root = Path.join(base_dir, "worker_#{i}")
 
       root
-      |> create_sandbox(project_root, build_env, test_paths)
+      |> do_create_sandbox(project_root, build_env, test_paths, auxiliary_paths)
       |> Map.put(:owner_token, owner_token)
     end
+  end
+
+  @doc false
+  def validate_auxiliary_paths!(project_root, paths) when is_list(paths) do
+    project_root = Path.expand(project_root)
+
+    paths
+    |> Enum.map(&validate_auxiliary_path!(project_root, &1))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  def validate_auxiliary_paths!(_project_root, paths) do
+    raise ArgumentError, "unsafe auxiliary project paths: #{inspect(paths)}"
   end
 
   @doc """
@@ -65,6 +82,10 @@ defmodule Muex.Sandbox do
   """
   @spec create_sandbox(Path.t(), Path.t(), String.t(), [String.t()]) :: sandbox()
   def create_sandbox(root, project_root, build_env, test_paths) do
+    do_create_sandbox(root, Path.expand(project_root), build_env, test_paths, [])
+  end
+
+  defp do_create_sandbox(root, project_root, build_env, test_paths, auxiliary_paths) do
     File.mkdir_p!(root)
 
     # Symlink top-level files
@@ -92,6 +113,10 @@ defmodule Muex.Sandbox do
         | test_paths
       ]
     )
+
+    Enum.each(auxiliary_paths, fn path ->
+      link_path(root, project_root, Path.join(project_root, path))
+    end)
 
     # Symlink deps/ (shared, read-only)
     safe_symlink(Path.join(project_root, "deps"), Path.join(root, "deps"))
@@ -265,10 +290,47 @@ defmodule Muex.Sandbox do
   end
 
   defp canonical_existing_result(path) do
-    case System.cmd("realpath", ["-e", path], stderr_to_stdout: true) do
+    case System.cmd("realpath", ["-e", "--", path], stderr_to_stdout: true) do
       {canonical, 0} -> {:ok, String.trim(canonical)}
       {_message, _status} -> {:error, :not_canonical}
     end
+  end
+
+  defp validate_auxiliary_path!(project_root, path) when is_binary(path) do
+    parts = Path.split(path)
+    candidate = Path.expand(path, project_root)
+
+    valid? =
+      Path.type(path) == :relative and parts != [] and
+        Enum.all?(parts, &(&1 not in [".", ".."])) and Path.join(parts) == path and
+        String.starts_with?(candidate, project_root <> "/") and
+        canonical_existing_result(project_root) == {:ok, project_root} and
+        canonical_existing_result(candidate) == {:ok, candidate} and
+        safe_auxiliary_tree?(candidate)
+
+    if valid?, do: Path.relative_to(candidate, project_root), else: unsafe_auxiliary_path!(path)
+  end
+
+  defp validate_auxiliary_path!(_project_root, path), do: unsafe_auxiliary_path!(path)
+
+  defp safe_auxiliary_tree?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        true
+
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, entries} -> Enum.all?(entries, &safe_auxiliary_tree?(Path.join(path, &1)))
+          {:error, _reason} -> false
+        end
+
+      _other ->
+        false
+    end
+  end
+
+  defp unsafe_auxiliary_path!(path) do
+    raise ArgumentError, "unsafe auxiliary project path: #{inspect(path)}"
   end
 
   defp safe_root?(root, base) do

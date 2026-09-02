@@ -106,6 +106,40 @@ defmodule Muex.HardeningTest do
   end
 
   @tag :tmp_dir
+  test "coverage collection materializes explicit auxiliary project paths", %{tmp_dir: tmp_dir} do
+    project = coverage_fixture!(tmp_dir)
+    source = Path.join(project, "lib/example.ex")
+    test_file = Path.join(project, "test/auxiliary_test.exs")
+    File.mkdir_p!(Path.join(project, "bin"))
+    File.write!(Path.join(project, "bin/runtime-value"), "available")
+
+    File.write!(
+      test_file,
+      """
+      defmodule MuexCoverageFixture.AuxiliaryTest do
+        use ExUnit.Case
+
+        test "auxiliary path" do
+          assert File.read!("bin/runtime-value") == "available"
+          assert MuexCoverageFixture.Example.value() == 1
+        end
+      end
+      """
+    )
+
+    index =
+      Coverage.collect(
+        [test_file],
+        %{source => MuexCoverageFixture.Example},
+        cd: project,
+        auxiliary_paths: ["bin"],
+        output: Path.join(tmp_dir, "audit/coverage")
+      )
+
+    assert {:covered, [^test_file]} = Coverage.tests_for(index, source, 2)
+  end
+
+  @tag :tmp_dir
   test "coverage batches a partition and conservatively attributes its covered lines", %{
     tmp_dir: tmp_dir
   } do
@@ -136,10 +170,14 @@ defmodule Muex.HardeningTest do
     project = coverage_fixture!(tmp_dir)
     source_files = Path.join(tmp_dir, "source-files.txt")
     test_files = Path.join(tmp_dir, "test-files.txt")
+    auxiliary_paths = Path.join(tmp_dir, "auxiliary-paths.txt")
     index_path = Path.join(tmp_dir, "partition-1.etf")
     audit_dir = Path.join(tmp_dir, "partition-1-audit")
+    File.mkdir_p!(Path.join(project, "bin"))
+    File.write!(Path.join(project, "bin/runtime-value"), "available")
     File.write!(source_files, "lib/example.ex\n")
     File.write!(test_files, "test/example_test.exs\ntest/other_test.exs\n")
+    File.write!(auxiliary_paths, "bin\n")
     Mix.Task.reenable("muex.coverage")
 
     assert :ok =
@@ -153,6 +191,8 @@ defmodule Muex.HardeningTest do
                test_files,
                "--corpus-test-files",
                test_files,
+               "--auxiliary-paths-file",
+               auxiliary_paths,
                "--index",
                index_path,
                "--audit-dir",
@@ -167,6 +207,15 @@ defmodule Muex.HardeningTest do
     assert manifest["batch"]["test_count"] == 2
     assert Enum.sort(manifest["batch"]["evidence"]) == Enum.sort(manifest["evidence"])
     assert Enum.all?(manifest["batch"]["evidence"], &File.regular?(&1["path"]))
+
+    assert manifest["corpus_fingerprint"] ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/example_test.exs", "test/other_test.exs"],
+               nil,
+               ["bin"]
+             )
   end
 
   @tag :tmp_dir

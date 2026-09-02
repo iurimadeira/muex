@@ -178,6 +178,53 @@ defmodule Muex.SandboxTest do
   end
 
   describe "create_pool/2" do
+    test "materializes explicit project-relative auxiliary roots and files" do
+      project_root =
+        Path.join(System.tmp_dir!(), "muex_test_project_#{System.system_time(:microsecond)}")
+
+      File.mkdir_p!(Path.join(project_root, "bin"))
+      File.write!(Path.join(project_root, "mix.exs"), "# fake mix.exs")
+      File.write!(Path.join(project_root, "bin/helper"), "helper")
+      File.write!(Path.join(project_root, "runtime.json"), "{}")
+
+      on_exit(fn -> File.rm_rf!(project_root) end)
+
+      [sandbox] =
+        Sandbox.create_pool(1,
+          project_root: project_root,
+          test_paths: [],
+          auxiliary_paths: ["bin", "runtime.json"]
+        )
+
+      on_exit(fn -> Sandbox.cleanup([sandbox]) end)
+
+      assert File.read!(Path.join(sandbox.root, "bin/helper")) == "helper"
+      assert File.read!(Path.join(sandbox.root, "runtime.json")) == "{}"
+    end
+
+    test "rejects unsafe, missing, and symlinked auxiliary paths" do
+      project_root =
+        Path.join(System.tmp_dir!(), "muex_test_project_#{System.system_time(:microsecond)}")
+
+      File.mkdir_p!(Path.join(project_root, "bin"))
+      File.write!(Path.join(project_root, "mix.exs"), "# fake mix.exs")
+      File.write!(Path.join(project_root, "bin/helper"), "helper")
+      File.ln_s!(Path.join(project_root, "bin"), Path.join(project_root, "linked"))
+      File.ln_s!(Path.join(project_root, "mix.exs"), Path.join(project_root, "bin/linked"))
+
+      on_exit(fn -> File.rm_rf!(project_root) end)
+
+      for path <- ["../outside", "bin/../bin", "missing", "linked", "bin"] do
+        assert_raise ArgumentError, ~r/unsafe auxiliary project path/, fn ->
+          Sandbox.create_pool(1,
+            project_root: project_root,
+            test_paths: [],
+            auxiliary_paths: [path]
+          )
+        end
+      end
+    end
+
     test "creates the requested number of sandboxes" do
       sandboxes = Sandbox.create_pool(3, project_root: @project_root, test_paths: ["test"])
       on_exit(fn -> Sandbox.cleanup(sandboxes) end)
