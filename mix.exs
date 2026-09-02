@@ -111,6 +111,7 @@ defmodule Muex.MixProject do
         docs/INSTALLATION.md
         docs/MUTATION_OPTIMIZATION.md
         docs/COMPARISON.md
+        docs/CAMPAIGN_API.md
       ),
       licenses: ["MIT"],
       maintainers: ["Aleksei Matiushkin"],
@@ -146,7 +147,8 @@ defmodule Muex.MixProject do
       "USAGE.md": [title: "Usage Guide"],
       "docs/INSTALLATION.md": [title: "Installation Guide"],
       "docs/MUTATION_OPTIMIZATION.md": [title: "Mutation Optimization"],
-      "docs/COMPARISON.md": [title: "Comparison: Muex vs Darwin vs Exavier"]
+      "docs/COMPARISON.md": [title: "Comparison: Muex vs Darwin vs Exavier"],
+      "docs/CAMPAIGN_API.md": [title: "Campaign API"]
     ]
   end
 
