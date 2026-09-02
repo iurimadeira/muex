@@ -121,14 +121,15 @@ defmodule Muex.HardeningTest do
 
         test "auxiliary path" do
           assert File.read!("bin/runtime-value") == "available"
+          assert {:error, :eacces} = File.write("bin/runtime-value", "sandbox mutation")
           assert MuexCoverageFixture.Example.value() == 1
         end
       end
       """
     )
 
-    index =
-      Coverage.collect(
+    collection =
+      Coverage.collect_with_auxiliary_snapshot(
         [test_file],
         %{source => MuexCoverageFixture.Example},
         cd: project,
@@ -136,7 +137,37 @@ defmodule Muex.HardeningTest do
         output: Path.join(tmp_dir, "audit/coverage")
       )
 
-    assert {:covered, [^test_file]} = Coverage.tests_for(index, source, 2)
+    assert {:covered, [^test_file]} = Coverage.tests_for(collection.index, source, 2)
+    assert File.read!(Path.join(project, "bin/runtime-value")) == "available"
+
+    snapshot_fingerprint =
+      Coverage.corpus_fingerprint_from_auxiliary_snapshot(
+        project,
+        ["lib/example.ex"],
+        ["test/auxiliary_test.exs"],
+        nil,
+        collection.auxiliary_snapshot
+      )
+
+    assert snapshot_fingerprint ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/auxiliary_test.exs"],
+               nil,
+               ["bin"]
+             )
+
+    File.write!(Path.join(project, "bin/runtime-value"), "source drift")
+
+    refute snapshot_fingerprint ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/auxiliary_test.exs"],
+               nil,
+               ["bin"]
+             )
   end
 
   @tag :tmp_dir

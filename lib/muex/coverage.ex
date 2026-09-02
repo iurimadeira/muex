@@ -103,7 +103,26 @@ defmodule Muex.Coverage do
         auxiliary_paths \\ []
       ) do
     root = Path.expand(project_root)
-    auxiliary = fingerprint_auxiliary_paths(root, auxiliary_paths)
+    auxiliary_snapshot = fingerprint_auxiliary_paths(root, auxiliary_paths)
+
+    corpus_fingerprint_from_auxiliary_snapshot(
+      root,
+      source_files,
+      test_files,
+      selective_manifest,
+      auxiliary_snapshot
+    )
+  end
+
+  @doc false
+  def corpus_fingerprint_from_auxiliary_snapshot(
+        project_root,
+        source_files,
+        test_files,
+        selective_manifest,
+        auxiliary_snapshot
+      ) do
+    root = Path.expand(project_root)
 
     common = {
       fingerprint_files(root, source_files),
@@ -114,7 +133,7 @@ defmodule Muex.Coverage do
       Application.spec(:muex, :vsn)
     }
 
-    case auxiliary do
+    case auxiliary_snapshot do
       [] -> digest(Tuple.insert_at(common, 0, "muex-coverage-corpus-v1"))
       entries -> digest({"muex-coverage-corpus-v2", common, entries})
     end
@@ -285,6 +304,11 @@ defmodule Muex.Coverage do
   """
   @spec collect([Path.t()], %{Path.t() => module()}, keyword()) :: t()
   def collect(test_files, file_to_module, opts \\ []) do
+    collect_with_auxiliary_snapshot(test_files, file_to_module, opts).index
+  end
+
+  @doc false
+  def collect_with_auxiliary_snapshot(test_files, file_to_module, opts \\ []) do
     project_root = opts |> Keyword.get(:cd, File.cwd!()) |> Path.expand()
     test_paths = Keyword.get(opts, :test_paths, [Path.join(project_root, "test")])
     auxiliary_paths = Keyword.get(opts, :auxiliary_paths, [])
@@ -310,10 +334,15 @@ defmodule Muex.Coverage do
 
     try do
       prepare_sandbox!(sandbox, Map.keys(file_to_module))
+      auxiliary_snapshot = fingerprint_auxiliary_paths(sandbox.root, auxiliary_paths)
 
       sandbox_test_files = Enum.map(test_files, &Path.relative_to(&1, project_root))
       coverdata = run_with_coverage!(test_files, sandbox_test_files, sandbox.root, output)
-      merge_coverage(new(), test_files, coverdata, module_to_path)
+
+      %{
+        index: merge_coverage(new(), test_files, coverdata, module_to_path),
+        auxiliary_snapshot: auxiliary_snapshot
+      }
     after
       Sandbox.cleanup(sandboxes)
     end

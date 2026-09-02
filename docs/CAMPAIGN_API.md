@@ -225,8 +225,9 @@ their paths, sizes, and digests are recorded as the partition's `evidence`.
 `--auxiliary-paths-file` is optional. Each nonblank line names an explicit
 project-relative existing file or directory that tests need inside the private
 coverage sandbox. Traversal, absolute paths, missing paths, symlinks, and
-special files are rejected. The listed names and complete contents participate
-in the corpus fingerprint.
+special files are rejected. Muex copies and makes these snapshots read-only;
+tests never execute through live links to the project. The listed names and
+exact snapshot contents participate in the corpus fingerprint.
 
 ### 3. Merge and validate
 

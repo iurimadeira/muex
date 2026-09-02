@@ -113,8 +113,8 @@ defmodule Mix.Tasks.Muex.Coverage do
 
     audit_dir = Keyword.fetch!(opts, :audit_dir)
 
-    index =
-      Coverage.collect(test_files, file_to_module,
+    collection =
+      Coverage.collect_with_auxiliary_snapshot(test_files, file_to_module,
         cd: root,
         test_paths: [Path.join(root, "test")],
         auxiliary_paths: auxiliary_paths,
@@ -122,16 +122,16 @@ defmodule Mix.Tasks.Muex.Coverage do
       )
 
     index_path = Keyword.fetch!(opts, :index)
-    Coverage.write_index!(index, index_path)
+    Coverage.write_index!(collection.index, index_path)
     batch_evidence = evidence(audit_dir)
 
     corpus_fingerprint =
-      Coverage.corpus_fingerprint(
+      Coverage.corpus_fingerprint_from_auxiliary_snapshot(
         root,
         source_files,
         corpus_test_files,
         System.get_env("MUEX_COVERAGE_MODULES_FILE"),
-        auxiliary_paths
+        collection.auxiliary_snapshot
       )
 
     write_json!(index_path <> ".manifest.json", %{

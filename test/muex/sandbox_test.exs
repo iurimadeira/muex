@@ -200,6 +200,16 @@ defmodule Muex.SandboxTest do
 
       assert File.read!(Path.join(sandbox.root, "bin/helper")) == "helper"
       assert File.read!(Path.join(sandbox.root, "runtime.json")) == "{}"
+      assert {:error, _reason} = File.read_link(Path.join(sandbox.root, "bin"))
+      assert {:error, _reason} = File.read_link(Path.join(sandbox.root, "runtime.json"))
+
+      File.write!(Path.join(project_root, "bin/helper"), "source changed")
+
+      assert {:error, :eacces} =
+               File.write(Path.join(sandbox.root, "runtime.json"), "sandbox changed")
+
+      assert File.read!(Path.join(sandbox.root, "bin/helper")) == "helper"
+      assert File.read!(Path.join(project_root, "runtime.json")) == "{}"
     end
 
     test "rejects unsafe, missing, and symlinked auxiliary paths" do
