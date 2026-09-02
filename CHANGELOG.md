@@ -23,11 +23,11 @@ across many machines and resume it after an interruption. See
 - **Shard execution**: `mix muex` accepts `--mutant-ids-file`, `--campaign-fingerprint`, `--checkpoint`, and `--audit-dir` to run exactly one shard of a sealed plan. The checkpoint is append-only JSONL and is the resume point — re-running a shard skips every mutation already recorded.
 - **`mix muex.validate`**: turns a shard's plan, checkpoint, and report into a validation artifact, with every referenced artifact path constrained to a declared `--artifact-root`.
 - **`mix muex.continuation prepare` / `finalize`**: splits an interrupted campaign into a child campaign covering only the mutations the parent never finalized, sealed with `parent_selected_ids_sha256`, and refuses to close unless every parent mutation is accounted for.
-- **`mix muex.coverage`**: helper task backing coverage-index and shard-partition generation for campaign runs. Not covered by `docs/CAMPAIGN_API.md`.
+- **`mix muex.coverage`**: helper task backing coverage-index and shard-partition generation for campaign runs. Not covered by `docs/CAMPAIGN_API.md` as of this release; documented under [Unreleased].
 - **Inventory cache**: `--inventory-cache-file` / `--inventory-cache-key` let sibling shards and child campaigns reuse one mutation inventory instead of regenerating it per shard.
 - **New campaign CLI options**: `--audit-dir`, `--audit-only`, `--audit-plan`, `--campaign-fingerprint`, `--checkpoint`, `--inventory-cache-file`, `--inventory-cache-key`, `--mutant-ids-file`, `--report-file`.
 - **`--baseline-timeout`**: separate timeout for the baseline test run, independent of the per-mutant `--timeout`.
-- **Additional `mix muex` switches**, plumbing for an orchestrator rather than part of the documented seam: `--changed-diff-file` (feed a precomputed diff instead of shelling out to git for `--since`), `--coverage-index-file` and `--coverage-corpus-fingerprint` (bind a coverage-guided run to a prebuilt index), and `--mutant-id` (run exactly one mutation). None are covered by `docs/CAMPAIGN_API.md`.
+- **Additional `mix muex` switches**, plumbing for an orchestrator rather than part of the documented seam: `--changed-diff-file` (feed a precomputed diff instead of shelling out to git for `--since`), `--coverage-index-file` and `--coverage-corpus-fingerprint` (bind a coverage-guided run to a prebuilt index), and `--mutant-id` (run exactly one mutation). None are covered by `docs/CAMPAIGN_API.md` as of this release; `--coverage-index-file` and `--coverage-corpus-fingerprint` are documented under [Unreleased].
 - **`scripts/campaign_e2e.exs`**: drives inventory → build → slice → shard → validate → continuation against a throwaway fixture project and fails on the first broken step.
 
 ### Fixed

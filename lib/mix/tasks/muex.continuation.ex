@@ -1,6 +1,13 @@
 defmodule Mix.Tasks.Muex.Continuation do
   @shortdoc "Prepares or finalizes an immutable Muex continuation"
-  @moduledoc false
+  @moduledoc """
+  Splits and re-joins an interrupted mutation campaign.
+
+  `prepare` seals a child campaign covering only the mutations the parent never
+  finalized; `finalize` refuses to close unless every parent mutation is
+  accounted for. Part of the seam documented in `docs/CAMPAIGN_API.md`, which is
+  the single source for their options and artifact layout.
+  """
   use Mix.Task
 
   alias Muex.Continuation.Artifact

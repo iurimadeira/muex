@@ -1,7 +1,13 @@
 defmodule Mix.Tasks.Muex.Validate do
   @shortdoc "Validates one Muex audit shard"
 
-  @moduledoc false
+  @moduledoc """
+  Turns one shard's plan, checkpoint, and report into a validation artifact.
+
+  Every referenced artifact path is constrained to a declared `--artifact-root`.
+  Part of the seam documented in `docs/CAMPAIGN_API.md`, which is the single
+  source for its options and output shape.
+  """
   use Mix.Task
 
   alias Muex.Audit.Validator

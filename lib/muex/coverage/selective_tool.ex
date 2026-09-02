@@ -3,18 +3,23 @@ defmodule Muex.Coverage.SelectiveTool do
   Mix coverage tool that instruments only the campaign's selected modules.
 
   The module manifest is generated from an already compiled application build.
-  Ordinary `mix test --cover` runs do not select this tool.
 
-  A campaign selects it from the project under test:
+  A campaign selects this tool from the project under test:
 
       test_coverage: [tool: Muex.Coverage.SelectiveTool]
 
   and points `MUEX_COVERAGE_MODULES_FILE` at a manifest written by
-  `write_manifest!/4` (or by `mix muex.coverage manifest`). The tool raises
-  `Mix.Error` when that variable is unset, when the manifest is malformed or
-  carries an unsupported version, and when a listed beam is missing, duplicated,
-  or resolves outside the compile path. It never traverses beams the manifest
-  did not list.
+  `write_manifest!/4` (or by `mix muex.coverage manifest`). Selection is not
+  per-run: once configured, every `mix test --cover` run in that project uses
+  this tool and requires that variable, so keep the setting in a coverage-only
+  configuration rather than in the project's ordinary test config.
+
+  The tool raises `Mix.Error` when that variable is unset, when the manifest
+  path is not a regular file, when the compile path does not exist, when the
+  manifest is malformed or carries an unsupported version, and when a listed
+  beam is missing, unreadable, duplicated, does not define the module it is
+  listed under, or resolves outside the compile path. It never traverses beams
+  the manifest did not list.
 
   `mix muex.coverage` drives this tool for a campaign; see
   `docs/CAMPAIGN_API.md`.
@@ -93,9 +98,17 @@ defmodule Muex.Coverage.SelectiveTool do
   @doc """
   Reads a manifest written by `write_manifest!/4`, resolved against `compile_path`.
 
-  Returns one entry per selected module as `%{source: relative path, module: atom,
-  beam: path}`. Raises `Mix.Error` on a malformed or unsupported manifest, on a
-  duplicate module, and on a beam that is missing or outside `compile_path`.
+  Returns one entry per selected module as a map with three keys: `:source`,
+  echoed verbatim from the manifest and only checked to be a non-empty string;
+  `:module`, the atom; and `:beam`, the canonical absolute path of the beam
+  inside `compile_path`. Note the asymmetry with `write_manifest!/4`, which
+  records the beam as a bare basename.
+
+  Raises `Mix.Error` when the manifest path is not a regular file, when
+  `compile_path` does not exist, when the manifest is malformed or carries an
+  unsupported version, and when a listed beam is missing, unreadable,
+  duplicated, does not define the module it is listed under, or resolves outside
+  `compile_path`.
   """
   @spec read_manifest!(Path.t(), Path.t()) :: [
           %{source: String.t(), module: module(), beam: Path.t()}

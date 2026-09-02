@@ -13,7 +13,20 @@ defmodule Mix.Tasks.Muex.CoverageTest do
     assert {:docs_v1, _, _, _, %{"en" => task_doc}, _, _} = Code.fetch_docs(CoverageTask)
     assert task_doc =~ "docs/CAMPAIGN_API.md"
     assert task_doc =~ "MUEX_COVERAGE_MODULES_FILE"
-    assert task_doc =~ "--auxiliary-paths-file"
+
+    for subcommand <- ~w(manifest export merge validate) do
+      assert task_doc =~ "`#{subcommand}`"
+    end
+
+    for sibling <- [Mix.Tasks.Muex.Campaign, Mix.Tasks.Muex.Continuation, Mix.Tasks.Muex.Validate] do
+      assert {:docs_v1, _, _, _, %{"en" => doc}, _, _} = Code.fetch_docs(sibling)
+      assert doc =~ "docs/CAMPAIGN_API.md"
+    end
+
+    assert "docs/CAMPAIGN_API.md" in Mix.Project.config()[:package][:files]
+
+    assert {:"docs/CAMPAIGN_API.md", _} =
+             List.keyfind(Mix.Project.config()[:docs][:extras], :"docs/CAMPAIGN_API.md", 0)
 
     assert {:docs_v1, _, _, _, %{"en" => tool_doc}, _, tool_docs} = Code.fetch_docs(SelectiveTool)
     assert tool_doc =~ "test_coverage: [tool: Muex.Coverage.SelectiveTool]"
@@ -97,6 +110,7 @@ defmodule Mix.Tasks.Muex.CoverageTest do
     decoded = manifest |> File.read!() |> Jason.decode!()
     assert decoded["version"] == 1
     assert decoded["test_count"] == 2
+    assert decoded["corpus_fingerprint"] == "corpus-fingerprint"
     assert Enum.map(decoded["parts"], & &1["path"]) == [a, b]
     assert File.read!(index <> ".manifest.json") == File.read!(manifest)
 
@@ -112,26 +126,46 @@ defmodule Mix.Tasks.Muex.CoverageTest do
              ])
   end
 
-  test "merge refuses partitions that overlap or miss the corpus", %{tmp_dir: tmp_dir} do
+  test "merge refuses partitions that overlap while covering the corpus", %{tmp_dir: tmp_dir} do
     corpus = ~w(test/a_test.exs test/b_test.exs)
     a = partition!(tmp_dir, "a", ["test/a_test.exs"], corpus, "lib/a.ex")
-    duplicate = partition!(tmp_dir, "duplicate", ["test/a_test.exs"], corpus, "lib/b.ex")
-
-    expected = write_lines!(tmp_dir, "expected.txt", corpus)
-    parts = write_lines!(tmp_dir, "parts.txt", [a, duplicate])
+    both = partition!(tmp_dir, "both", corpus, corpus, "lib/b.ex")
 
     assert_raise Mix.Error, ~r/coverage partitions are not disjoint and exhaustive/, fn ->
-      CoverageTask.run([
-        "merge",
-        "--parts-file",
-        parts,
-        "--expected-tests-file",
-        expected,
-        "--index",
-        Path.join(tmp_dir, "merged.etf"),
-        "--manifest",
-        Path.join(tmp_dir, "merged.manifest.json")
-      ])
+      merge!(tmp_dir, [a, both], corpus)
+    end
+  end
+
+  test "merge refuses disjoint partitions that miss part of the corpus", %{tmp_dir: tmp_dir} do
+    corpus = ~w(test/a_test.exs test/b_test.exs)
+    a = partition!(tmp_dir, "a", ["test/a_test.exs"], corpus, "lib/a.ex")
+
+    assert_raise Mix.Error, ~r/coverage partitions are not disjoint and exhaustive/, fn ->
+      merge!(tmp_dir, [a], corpus)
+    end
+  end
+
+  test "merge refuses a partition whose batch contradicts its tests", %{tmp_dir: tmp_dir} do
+    corpus = ["test/a_test.exs"]
+    a = partition!(tmp_dir, "a", corpus, corpus, "lib/a.ex")
+    patch_manifest!(a, &put_in(&1["batch"]["test_count"], 99))
+
+    assert_raise Mix.Error, ~r/invalid coverage partition/, fn ->
+      merge!(tmp_dir, [a], corpus)
+    end
+  end
+
+  test "merge refuses a partition whose evidence no longer hashes", %{tmp_dir: tmp_dir} do
+    corpus = ["test/a_test.exs"]
+    a = partition!(tmp_dir, "a", corpus, corpus, "lib/a.ex")
+
+    a
+    |> read_manifest!()
+    |> get_in(["evidence", Access.at(0), "path"])
+    |> File.write!("tampered")
+
+    assert_raise Mix.Error, ~r/invalid coverage partition/, fn ->
+      merge!(tmp_dir, [a], corpus)
     end
   end
 
@@ -236,6 +270,26 @@ defmodule Mix.Tasks.Muex.CoverageTest do
     )
 
     index
+  end
+
+  defp merge!(tmp_dir, parts, corpus) do
+    CoverageTask.run([
+      "merge",
+      "--parts-file",
+      write_lines!(tmp_dir, "parts.txt", parts),
+      "--expected-tests-file",
+      write_lines!(tmp_dir, "expected.txt", corpus),
+      "--index",
+      Path.join(tmp_dir, "merged.etf"),
+      "--manifest",
+      Path.join(tmp_dir, "merged.manifest.json")
+    ])
+  end
+
+  defp read_manifest!(index), do: (index <> ".manifest.json") |> File.read!() |> Jason.decode!()
+
+  defp patch_manifest!(index, fun) do
+    File.write!(index <> ".manifest.json", index |> read_manifest!() |> fun.() |> Jason.encode!())
   end
 
   defp write_lines!(tmp_dir, name, lines) do

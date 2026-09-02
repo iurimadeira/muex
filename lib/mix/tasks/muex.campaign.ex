@@ -1,7 +1,15 @@
 defmodule Mix.Tasks.Muex.Campaign do
   @shortdoc "Builds an immutable sharded mutation campaign plan"
 
-  @moduledoc false
+  @moduledoc """
+  Seals and slices an immutable, sharded mutation campaign plan.
+
+  `build` turns an audited inventory into a content-addressed, source-file-atomic
+  plan; `slice` materializes the exact work of one shard under its own
+  `slice_sha256`. Both are part of the seam documented in
+  `docs/CAMPAIGN_API.md`, which is the single source for their options, their
+  artifacts, and the coverage binding they carry.
+  """
   use Mix.Task
 
   alias Muex.Audit.Validator

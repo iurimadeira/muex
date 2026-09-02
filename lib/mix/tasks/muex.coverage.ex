@@ -4,63 +4,44 @@ defmodule Mix.Tasks.Muex.Coverage do
   @moduledoc """
   Builds the coverage index a campaign binds itself to.
 
-  This is the coverage half of the seam documented in `docs/CAMPAIGN_API.md`;
-  read that file for how the artifacts below feed `mix muex.campaign build`,
-  `mix muex.campaign slice`, and a shard run.
+  This is the coverage half of the seam documented in `docs/CAMPAIGN_API.md`.
+  That file is the single source for the invocations, the artifact layout, the
+  fingerprint rules, and `MUEX_COVERAGE_MODULES_FILE`; this moduledoc only names
+  the subcommands and the failures.
 
   ## Subcommands
 
-  `manifest` writes the selective module manifest for the campaign's sources,
-  resolved against the current `Mix.Project.compile_path/0`:
-
-      mix muex.coverage manifest --project-root . \\
-        --source-files sources.txt --output selective.json
-
-  `export` runs the given tests under `Muex.Coverage.SelectiveTool` and writes
-  a coverage index plus its adjacent `<index>.manifest.json`:
-
-      mix muex.coverage export --project-root . \\
-        --source-files sources.txt --test-files part-1.txt \\
-        --corpus-test-files tests.txt --auxiliary-paths-file auxiliary.txt \\
-        --partition 1 \\
-        --index part-1.etf --audit-dir audit/part-1
-
-  `merge` joins partition indexes into one index and manifest, and `validate`
-  re-checks an index against its manifest:
-
-      mix muex.coverage merge --parts-file parts.txt \\
-        --expected-tests-file tests.txt --index coverage.etf \\
-        --manifest coverage.manifest.json
-
-      mix muex.coverage validate --expected-tests-file tests.txt \\
-        --index coverage.etf --manifest coverage.manifest.json
+    * `manifest` - write the selective module manifest for the campaign's
+      sources, resolved against the current `Mix.Project.compile_path/0`.
+    * `export` - run one partition of the corpus under
+      `mix test --no-compile --cover` and write a coverage index plus its
+      adjacent `<index>.manifest.json`. The tool that instruments the run comes
+      from the target project's own `test_coverage:`, not from this task.
+    * `merge` - join partition indexes into one index and manifest.
+    * `validate` - re-check an index against its manifest.
 
   `--parts-file` lists *index* paths; each must still have its adjacent
   `<index>.manifest.json`, and `merge` mirrors its output manifest to the
   index's adjacent path when `--manifest` names a different file.
 
-  ## Inputs
-
-  Every path option is read as given; newline-delimited list files ignore blank
-  lines. `--auxiliary-paths-file` lists explicit project-relative existing
-  roots/files needed by tests inside the coverage sandbox. The same list must
-  be passed to `mix muex.campaign build`. `MUEX_COVERAGE_MODULES_FILE` selects
-  the manifest written by
-  `manifest`: `export` instruments exactly its modules and folds the file into
-  the index's `corpus_fingerprint`. Leaving it unset makes `export` load the
-  sources itself and fingerprint without a selective manifest, so it must be
-  set identically for `export` and for the `--selective-manifest` of
-  `mix muex.campaign build`.
-
   ## Failures
 
-  Every failure raises `Mix.Error`: unknown subcommands, missing or invalid
-  options, a partition whose manifest no longer matches its index
-  (`invalid coverage partition`), partitions that are not disjoint and
-  exhaustive over the expected corpus, and an index that drifted from its
-  manifest (`coverage index validation failed`). A fingerprint mismatch is not
-  raised here — it surfaces later as a degraded campaign slice, see
-  `docs/CAMPAIGN_API.md`.
+  `Mix.Error` covers the options contract and the campaign invariants: unknown
+  subcommands, missing or invalid options, a partition whose manifest no longer
+  matches its index (`invalid coverage partition`), partitions that are not
+  disjoint and exhaustive over the expected corpus, and an index that drifted
+  from its manifest (`coverage index validation failed`).
+
+  Everything else surfaces as its own exception and is not normalized to
+  `Mix.Error`: a missing or unreadable file raises `File.Error`, malformed JSON
+  raises `Jason.DecodeError`, an undecodable coverage index raises
+  `ArgumentError` (so a corrupt index reaches `validate` as `ArgumentError`, not
+  as `coverage index validation failed`), and a failing `export` subprocess
+  raises `RuntimeError`. An orchestrator matching on message text must expect
+  all four.
+
+  A fingerprint mismatch is not raised here - it surfaces later as a degraded
+  campaign slice, see `docs/CAMPAIGN_API.md`.
   """
 
   use Mix.Task

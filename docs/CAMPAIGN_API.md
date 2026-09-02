@@ -5,7 +5,7 @@ mutation campaign across many machines, resume it after an interruption, and
 keep every artifact content-addressed and independently verifiable.
 
 The wrapper never links against Muex internals. Everything below is driven by
-four public Mix tasks:
+public Mix tasks:
 
 | Task | Role |
 | --- | --- |
@@ -58,7 +58,7 @@ mix muex.campaign build --project-root . \
 
 Build refuses the inventory unless all of these hold:
 
-* the inventory validates (`Muex.Audit.Validator`),
+* the inventory validates (Muex.Audit.Validator),
 * its source-file set equals `sources.txt` exactly,
 * its optimizer block matches `config.json`,
 * every source file carrying a *selected* mutation still hashes to the
@@ -128,7 +128,7 @@ exists`. Keep `--checkpoint`, move `--audit-dir` and `--report-file`.
 `mix muex --formatter` injection means **muex must be a dependency of the target
 project** (`{:muex, path: "..."}` or a released version). A shard run against a
 project that does not depend on muex fails with `missing_exunit_result` and an
-undefined `Muex.ExUnitFormatter`.
+undefined Muex.ExUnitFormatter.
 
 ## 5. Validation
 
@@ -193,8 +193,10 @@ test_coverage: [tool: Muex.Coverage.SelectiveTool]
 ```
 
 `Muex.Coverage.SelectiveTool` instruments only the modules named by
-`MUEX_COVERAGE_MODULES_FILE`, from an already compiled build. Ordinary
-`mix test --cover` runs never select it.
+`MUEX_COVERAGE_MODULES_FILE`, from an already compiled build. Once selected it
+applies to every `mix test --cover` run in that project and raises when the
+variable is unset, so select it in a coverage-only configuration rather than in
+the project's ordinary test config.
 
 ### 1. Selective manifest
 
@@ -206,8 +208,13 @@ mix muex.coverage manifest --project-root . \
 `sources.txt` is the same newline-delimited list the campaign is built from.
 The manifest maps each selected source to its module and beam inside the
 current `Mix.Project.compile_path/0`, so the build must already be compiled.
-It is optional but recommended: without it, coverage export instruments every
-source it can load, and the corpus fingerprint is computed without a manifest.
+
+It is mandatory whenever the project under test selects
+`Muex.Coverage.SelectiveTool`: the tool raises `Mix.Error` when
+`MUEX_COVERAGE_MODULES_FILE` is unset, which fails the `export` subprocess. It
+is optional only for a project that keeps another coverage tool, where `export`
+then instruments every source that tool can load and the corpus fingerprint is
+computed without a manifest.
 
 ### 2. Export
 
@@ -223,6 +230,10 @@ mix muex.coverage export --project-root . \
   --auxiliary-paths-file auxiliary.txt \
   --partition 1 --index coverage/part-1.etf --audit-dir audit/part-1
 ```
+
+`export` shells out to `mix test --no-compile --cover`; the coverage tool that
+actually instruments the run is whichever one the project's own
+`test_coverage:` names, not one `export` imposes.
 
 `--test-files` is this partition's tests; `--corpus-test-files` is always the
 whole campaign corpus, so every partition agrees on the same
@@ -312,7 +323,9 @@ requirement gets `"fallback_reason" => "coverage_artifact_stale"` with
 never silence a mutant. It is also lossy: a missing file, unreadable manifest,
 wrong version, fingerprint mismatch, digest mismatch, and undecodable index all
 collapse into the same `stale`, so an orchestrator that needs to tell them apart
-must re-run `mix muex.coverage validate` against the artifact.
+must re-run `mix muex.coverage validate` against the artifact. Passing no
+`--coverage-index` at all to a slice of a bound plan collapses into `stale` the
+same way, and is the most common operational cause.
 
 ### 6. Consuming the index in a shard run
 
@@ -330,9 +343,11 @@ mix muex --project-root . \
 fingerprint must be a lowercase SHA-256 digest. Passing the plan's fingerprint
 explicitly is the safe form: without it the run recomputes the fingerprint from
 its own `--files`, `--test-paths` and `MUEX_COVERAGE_MODULES_FILE`, which a
-shard-scoped file list will not reproduce. A rejected index is not an error —
-the run measures coverage in-process instead, so the shard stays correct and
-only loses the campaign's precomputed work.
+shard-scoped file list will not reproduce. A rejected index is not an error,
+but it is not free either: once `--coverage-index-file` is passed, the run does
+not fall back to measuring coverage in-process. It falls back to the full
+declared test corpus for that shard, so the shard stays correct while running
+every declared test for every mutant.
 
 Omitting `--coverage-index-file` entirely leaves `--coverage-guided` measuring
 coverage in-process for that shard.
@@ -402,7 +417,7 @@ mix run scripts/campaign_e2e.exs
 
 * `--report-file` writes the structured JSON report for every `--format`. The
   continuation flow needs that file, so it is always safe to pass.
-* Mutation IDs are stable across invocations: `Muex.mutation_id/6` over the
+* Mutation IDs are stable across invocations: Muex.mutation_id/6 over the
   mutator, description, file, line, patch, and target ordinal. It is an internal
   helper (`@doc false`) that hashes `inspect(mutator)` and expects the patch as a
   `%{before: _, after: _}` map; called with anything else it returns a different
