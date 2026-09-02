@@ -85,6 +85,37 @@ defmodule Muex.AuditOnlyTest do
     end
   end
 
+  @tag :tmp_dir
+  test "audit-only publishes valid statement deletions from a module body", %{tmp_dir: root} do
+    marker = Path.join(root, "test-executed")
+    plan_path = Path.join(root, "inventory.json")
+    write_project!(root, marker)
+
+    write!(root, "lib/example.ex", ~S'''
+    defmodule AuditOnlyFixture.Example do
+      @moduledoc """
+      Fixture with a contextual module-body block.
+      """
+
+      alias String, as: Text
+
+      def value, do: Text.upcase("original")
+    end
+    ''')
+
+    config =
+      config!(root,
+        audit_only: true,
+        audit_plan: plan_path,
+        mutators: "statement_deletion",
+        min_complexity: 0
+      )
+
+    assert {:ok, %{audit_only: true}} = Muex.run(config)
+    refute File.exists?(marker)
+    assert {:ok, %{selected_ids: [_ | _]}} = Validator.validate_plan_file(plan_path)
+  end
+
   defp config!(root, overrides) do
     {:ok, config} =
       Muex.Config.from_opts(

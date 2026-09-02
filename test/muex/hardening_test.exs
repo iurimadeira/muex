@@ -4,6 +4,7 @@ defmodule Muex.HardeningTest do
   import ExUnit.CaptureIO
 
   alias Muex.Audit
+  alias Muex.Audit.Validator
   alias Muex.Checkpoint
   alias Muex.Compiler
   alias Muex.Config
@@ -106,6 +107,71 @@ defmodule Muex.HardeningTest do
   end
 
   @tag :tmp_dir
+  test "coverage collection materializes explicit auxiliary project paths", %{tmp_dir: tmp_dir} do
+    project = coverage_fixture!(tmp_dir)
+    source = Path.join(project, "lib/example.ex")
+    test_file = Path.join(project, "test/auxiliary_test.exs")
+    File.mkdir_p!(Path.join(project, "bin"))
+    File.write!(Path.join(project, "bin/runtime-value"), "available")
+
+    File.write!(
+      test_file,
+      """
+      defmodule MuexCoverageFixture.AuxiliaryTest do
+        use ExUnit.Case
+
+        test "auxiliary path" do
+          assert File.read!("bin/runtime-value") == "available"
+          assert {:error, :eacces} = File.write("bin/runtime-value", "sandbox mutation")
+          assert MuexCoverageFixture.Example.value() == 1
+        end
+      end
+      """
+    )
+
+    collection =
+      Coverage.collect_with_auxiliary_snapshot(
+        [test_file],
+        %{source => MuexCoverageFixture.Example},
+        cd: project,
+        auxiliary_paths: ["bin"],
+        output: Path.join(tmp_dir, "audit/coverage")
+      )
+
+    assert {:covered, [^test_file]} = Coverage.tests_for(collection.index, source, 2)
+    assert File.read!(Path.join(project, "bin/runtime-value")) == "available"
+
+    snapshot_fingerprint =
+      Coverage.corpus_fingerprint_from_auxiliary_snapshot(
+        project,
+        ["lib/example.ex"],
+        ["test/auxiliary_test.exs"],
+        nil,
+        collection.auxiliary_snapshot
+      )
+
+    assert snapshot_fingerprint ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/auxiliary_test.exs"],
+               nil,
+               ["bin"]
+             )
+
+    File.write!(Path.join(project, "bin/runtime-value"), "source drift")
+
+    refute snapshot_fingerprint ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/auxiliary_test.exs"],
+               nil,
+               ["bin"]
+             )
+  end
+
+  @tag :tmp_dir
   test "coverage batches a partition and conservatively attributes its covered lines", %{
     tmp_dir: tmp_dir
   } do
@@ -136,10 +202,14 @@ defmodule Muex.HardeningTest do
     project = coverage_fixture!(tmp_dir)
     source_files = Path.join(tmp_dir, "source-files.txt")
     test_files = Path.join(tmp_dir, "test-files.txt")
+    auxiliary_paths = Path.join(tmp_dir, "auxiliary-paths.txt")
     index_path = Path.join(tmp_dir, "partition-1.etf")
     audit_dir = Path.join(tmp_dir, "partition-1-audit")
+    File.mkdir_p!(Path.join(project, "bin"))
+    File.write!(Path.join(project, "bin/runtime-value"), "available")
     File.write!(source_files, "lib/example.ex\n")
     File.write!(test_files, "test/example_test.exs\ntest/other_test.exs\n")
+    File.write!(auxiliary_paths, "bin\n")
     Mix.Task.reenable("muex.coverage")
 
     assert :ok =
@@ -153,6 +223,8 @@ defmodule Muex.HardeningTest do
                test_files,
                "--corpus-test-files",
                test_files,
+               "--auxiliary-paths-file",
+               auxiliary_paths,
                "--index",
                index_path,
                "--audit-dir",
@@ -167,6 +239,15 @@ defmodule Muex.HardeningTest do
     assert manifest["batch"]["test_count"] == 2
     assert Enum.sort(manifest["batch"]["evidence"]) == Enum.sort(manifest["evidence"])
     assert Enum.all?(manifest["batch"]["evidence"], &File.regular?(&1["path"]))
+
+    assert manifest["corpus_fingerprint"] ==
+             Coverage.corpus_fingerprint(
+               project,
+               ["lib/example.ex"],
+               ["test/example_test.exs", "test/other_test.exs"],
+               nil,
+               ["bin"]
+             )
   end
 
   @tag :tmp_dir
@@ -449,7 +530,9 @@ defmodule Muex.HardeningTest do
 
     report_file = Path.join(tmp_dir, "report.json")
     audit_dir = Path.join(tmp_dir, "audit")
+    auxiliary_paths_file = Path.join(tmp_dir, "auxiliary-paths.txt")
     campaign_fingerprint = String.duplicate("f", 64)
+    File.write!(auxiliary_paths_file, "CONTEXT-MAP.md\ndocs\n")
 
     assert {:ok, config} =
              Muex.Config.from_args([
@@ -464,7 +547,9 @@ defmodule Muex.HardeningTest do
                "--mutant-id",
                "abc123",
                "--campaign-fingerprint",
-               campaign_fingerprint
+               campaign_fingerprint,
+               "--auxiliary-paths-file",
+               auxiliary_paths_file
              ])
 
     assert config.report_file == report_file
@@ -472,6 +557,13 @@ defmodule Muex.HardeningTest do
     assert config.baseline_timeout_ms == 60_000
     assert config.mutant_id == "abc123"
     assert config.campaign_fingerprint == campaign_fingerprint
+    assert config.internal.auxiliary_paths == ["CONTEXT-MAP.md", "docs"]
+
+    assert {:error, "cannot read auxiliary paths file: no such file or directory"} =
+             Muex.Config.from_args([
+               "--auxiliary-paths-file",
+               Path.join(tmp_dir, "missing-auxiliary-paths.txt")
+             ])
 
     assert {:error, "--tce is disabled because compiler-equivalence detection is not sound"} =
              Muex.Config.from_args(["--tce"])
@@ -912,7 +1004,7 @@ defmodule Muex.HardeningTest do
     assert reasons == %{
              "first" => "selected_by_mutant_ids_file",
              "second" => "selected_by_mutant_ids_file",
-             "third" => "not_selected_by_mutant_ids_file"
+             "third" => "excluded_by_mutant_ids_file"
            }
 
     File.write!(ids_file, "first\nfirst\n")
@@ -924,6 +1016,59 @@ defmodule Muex.HardeningTest do
 
     assert {:error, "unknown mutant ids: missing"} =
              Muex.select_mutations_by_ids(mutations, ids_file)
+  end
+
+  @tag :tmp_dir
+  test "continuation plans validate selected and unrequested mutation reasons", %{
+    tmp_dir: tmp_dir
+  } do
+    project = mutation_fixture!(tmp_dir)
+    inventory_plan = Path.join(tmp_dir, "inventory-plan.json")
+    continuation_plan = Path.join(tmp_dir, "continuation-plan.json")
+    ids_file = Path.join(tmp_dir, "mutant-ids.txt")
+
+    config = fn plan, extra_opts ->
+      Muex.Config.from_opts(
+        [
+          files: Path.join(project, "lib/example.ex"),
+          project_root: project,
+          test_paths: "test",
+          mutators: "literal",
+          no_filter: true,
+          no_optimize: true,
+          audit_only: true,
+          audit_plan: plan
+        ] ++ extra_opts
+      )
+    end
+
+    assert {:ok, inventory_config} = config.(inventory_plan, [])
+    assert {:ok, %{selected_count: 2}} = Muex.run(inventory_config)
+
+    [selected | _unrequested] = Jason.decode!(File.read!(inventory_plan))["mutants"]
+    File.write!(ids_file, selected["id"] <> "\n")
+
+    assert {:ok, continuation_config} =
+             config.(continuation_plan, mutant_ids_file: ids_file)
+
+    assert {:ok, %{selected_count: 1}} = Muex.run(continuation_config)
+
+    assert {:ok, %{selected_ids: [selected_id]}} =
+             Validator.validate_plan_file(continuation_plan)
+
+    assert selected_id == selected["id"]
+
+    reasons =
+      continuation_plan
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.fetch!("mutants")
+      |> Map.new(&{&1["selected"], &1["selection_reason"]})
+
+    assert reasons == %{
+             true => "selected_by_mutant_ids_file",
+             false => "excluded_by_mutant_ids_file"
+           }
   end
 
   test "continuation proves imported, blocked, and pending partition the parent plan" do
@@ -1582,6 +1727,68 @@ defmodule Muex.HardeningTest do
                )
 
       assert output =~ "BASELINE_FAILED"
+    end)
+  end
+
+  @tag :tmp_dir
+  test "worker baselines materialize configured auxiliary project paths", %{tmp_dir: tmp_dir} do
+    project = mutation_fixture!(tmp_dir)
+    File.mkdir_p!(Path.join(project, "docs"))
+    File.write!(Path.join(project, "CONTEXT-MAP.md"), "context\n")
+    File.write!(Path.join(project, "docs/runtime-value"), "available\n")
+
+    body = """
+    if [ "${1:-}" = compile ]; then exit 0; fi
+    test "$(cat CONTEXT-MAP.md)" = context || exit 23
+    test "$(cat docs/runtime-value)" = available || exit 24
+    printf 'MUEX_EXUNIT_RESULT:%s:{"tests":1,"failures":0}\n' "$MUEX_EXUNIT_RESULT_NONCE"
+    """
+
+    with_fake_mix(tmp_dir, body, fn ->
+      assert {:ok, [%{result: :no_op}]} =
+               Runner.run_all_result(
+                 [mutation()],
+                 %{"lib/example.ex" => file_entry()},
+                 ElixirLanguage,
+                 %{},
+                 %{"lib/example.ex" => Example},
+                 max_workers: 1,
+                 project_root: project,
+                 test_paths: [Path.join(project, "test/example_test.exs")],
+                 auxiliary_paths: ["CONTEXT-MAP.md", "docs"],
+                 tce: false
+               )
+    end)
+  end
+
+  @tag :tmp_dir
+  test "Muex propagates the public auxiliary paths file into mutation sandboxes", %{
+    tmp_dir: tmp_dir
+  } do
+    project = mutation_fixture!(tmp_dir)
+    File.write!(Path.join(project, "CONTEXT-MAP.md"), "context\n")
+    paths_file = Path.join(tmp_dir, "auxiliary-paths.txt")
+    File.write!(paths_file, "CONTEXT-MAP.md\n")
+
+    assert {:ok, config} =
+             Muex.Config.from_opts(
+               files: Path.join(project, "lib/example.ex"),
+               project_root: project,
+               test_paths: Path.join(project, "test/example_test.exs"),
+               mutators: "literal",
+               no_filter: true,
+               no_optimize: true,
+               auxiliary_paths_file: paths_file
+             )
+
+    body = """
+    if [ "${1:-}" = compile ]; then exit 0; fi
+    test "$(cat CONTEXT-MAP.md)" = context || exit 23
+    printf 'MUEX_EXUNIT_RESULT:%s:{"tests":1,"failures":0}\n' "$MUEX_EXUNIT_RESULT_NONCE"
+    """
+
+    with_fake_mix(tmp_dir, body, fn ->
+      assert {:ok, %{results: [_ | _]}} = Muex.run(config)
     end)
   end
 
@@ -2460,6 +2667,35 @@ defmodule Muex.HardeningTest do
   end
 
   @tag :tmp_dir
+  test "resume fingerprint binds configured auxiliary path bytes", %{tmp_dir: tmp_dir} do
+    File.mkdir_p!(Path.join(tmp_dir, "lib"))
+    File.mkdir_p!(Path.join(tmp_dir, "test"))
+    File.mkdir_p!(Path.join(tmp_dir, "credo_checks"))
+    File.write!(Path.join(tmp_dir, "lib/example.ex"), "defmodule Example do\nend\n")
+    File.write!(Path.join(tmp_dir, "test/example_test.exs"), "")
+    auxiliary = Path.join(tmp_dir, "credo_checks/custom.ex")
+    File.write!(auxiliary, "one\n")
+    paths_file = Path.join(tmp_dir, "auxiliary-paths.txt")
+    File.write!(paths_file, "credo_checks\n")
+
+    assert {:ok, config} =
+             Muex.Config.from_opts(
+               files: "lib/example.ex",
+               test_paths: "test",
+               project_root: tmp_dir,
+               auxiliary_paths_file: paths_file
+             )
+
+    files = [%{path: "lib/example.ex"}]
+    tests = [Path.join(tmp_dir, "test/example_test.exs")]
+    before = Muex.checkpoint_metadata(config, files, tests)
+
+    File.write!(auxiliary, "two\n")
+
+    refute before.run == Muex.checkpoint_metadata(config, files, tests).run
+  end
+
+  @tag :tmp_dir
   test "resume fingerprint binds external coverage index contents, not its path", %{
     tmp_dir: tmp_dir
   } do
@@ -2564,6 +2800,110 @@ defmodule Muex.HardeningTest do
     assert header["total"] == 0
     assert header["campaign_fingerprint"] == "campaign"
     assert report |> File.read!() |> Jason.decode!() |> get_in(["summary", "total"]) == 0
+  end
+
+  @tag :tmp_dir
+  test "an empty shard publishes and resumes a complete validated artifact set", %{
+    tmp_dir: tmp_dir
+  } do
+    files = Path.join(tmp_dir, "lib/missing-shard.ex")
+    cache = Path.join(tmp_dir, "inventory/shard-42.etf")
+    cached_plan = Path.rootname(cache, ".etf") <> ".plan.json"
+    checkpoint = Path.join(tmp_dir, "shard-42.checkpoint.jsonl")
+    cache_key = String.duplicate("a", 64)
+    campaign_fingerprint = String.duplicate("b", 64)
+
+    run = fn name ->
+      audit = Path.join(tmp_dir, name)
+      report = Path.join(audit, "report.json")
+
+      assert {:ok, config} =
+               Muex.Config.from_args([
+                 "--files",
+                 files,
+                 "--project-root",
+                 tmp_dir,
+                 "--test-paths",
+                 "test",
+                 "--no-filter",
+                 "--audit-dir",
+                 audit,
+                 "--checkpoint",
+                 checkpoint,
+                 "--report-file",
+                 report,
+                 "--format",
+                 "json",
+                 "--inventory-cache-file",
+                 cache,
+                 "--inventory-cache-key",
+                 cache_key,
+                 "--campaign-fingerprint",
+                 campaign_fingerprint
+               ])
+
+      assert {:ok, %{results: []} = result} = Muex.run(config)
+      assert result.score_low == 0.0
+      assert result.score_high == 0.0
+      {audit, report}
+    end
+
+    validate = fn audit, report, output ->
+      plan = Path.join(audit, "plan.json")
+
+      assert %{
+               "candidate_count" => 0,
+               "exhaustive" => true,
+               "mutants" => [],
+               "selected_count" => 0,
+               "selected_source_file_count" => 0,
+               "source_file_count" => 0,
+               "source_files" => []
+             } = Jason.decode!(File.read!(plan))
+
+      assert %{"mutations" => [], "summary" => %{"total" => 0}} =
+               Jason.decode!(File.read!(report))
+
+      assert {:ok, %{selected_count: 0, result_count: 0}} =
+               Validator.validate(
+                 plan: plan,
+                 checkpoint: checkpoint,
+                 report: report,
+                 artifact_roots: [audit],
+                 campaign_fingerprint: campaign_fingerprint,
+                 output: output
+               )
+
+      assert File.regular?(output)
+    end
+
+    {first_audit, first_report} = run.("first-audit")
+    assert File.regular?(cache)
+    assert File.regular?(cached_plan)
+
+    assert %{"status" => "miss", "selected_count" => 0, "cache_key" => ^cache_key} =
+             first_audit
+             |> Path.join("inventory-cache.json")
+             |> File.read!()
+             |> Jason.decode!()
+
+    assert [%{"type" => "header", "total" => 0, "campaign_fingerprint" => ^campaign_fingerprint}] =
+             checkpoint |> File.stream!() |> Enum.map(&Jason.decode!/1)
+
+    validate.(first_audit, first_report, Path.join(first_audit, "validation.json"))
+    checkpoint_bytes = File.read!(checkpoint)
+
+    {second_audit, second_report} = run.("second-audit")
+
+    assert %{"status" => "hit", "selected_count" => 0, "cache_key" => ^cache_key} =
+             second_audit
+             |> Path.join("inventory-cache.json")
+             |> File.read!()
+             |> Jason.decode!()
+
+    assert File.read!(checkpoint) == checkpoint_bytes
+    assert File.read!(Path.join(second_audit, "plan.json")) == File.read!(cached_plan)
+    validate.(second_audit, second_report, Path.join(second_audit, "validation.json"))
   end
 
   @tag :tmp_dir

@@ -55,6 +55,54 @@ defmodule Muex.CoverageTest do
     assert Coverage.tests_for(Coverage.new(), "lib/a.ex", 1) == :unknown
   end
 
+  @tag :tmp_dir
+  test "corpus fingerprint binds auxiliary path names and contents", %{tmp_dir: root} do
+    for {path, contents} <- [
+          {"lib/a.ex", "source"},
+          {"test/a_test.exs", "test"},
+          {"bin/helper", "helper"},
+          {"runtime.json", "{}"}
+        ] do
+      target = Path.join(root, path)
+      File.mkdir_p!(Path.dirname(target))
+      File.write!(target, contents)
+    end
+
+    fingerprint =
+      Coverage.corpus_fingerprint(
+        root,
+        ["lib/a.ex"],
+        ["test/a_test.exs"],
+        nil,
+        ["bin", "runtime.json"]
+      )
+
+    File.write!(Path.join(root, "bin/helper"), "changed")
+
+    refute Coverage.corpus_fingerprint(
+             root,
+             ["lib/a.ex"],
+             ["test/a_test.exs"],
+             nil,
+             ["bin", "runtime.json"]
+           ) == fingerprint
+
+    assert Coverage.corpus_fingerprint(
+             root,
+             ["lib/a.ex"],
+             ["test/a_test.exs"],
+             nil,
+             ["runtime.json", "bin"]
+           ) ==
+             Coverage.corpus_fingerprint(
+               root,
+               ["lib/a.ex"],
+               ["test/a_test.exs"],
+               nil,
+               ["bin", "runtime.json"]
+             )
+  end
+
   describe "covered_lines/1" do
     test "keeps only the lines a `:cover` line analysis recorded as executed" do
       analysis = [{{SomeMod, 10}, 3}, {{SomeMod, 11}, 0}, {{SomeMod, 12}, 1}]

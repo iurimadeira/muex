@@ -178,6 +178,44 @@ defmodule Muex.AuditValidatorTest do
   end
 
   @tag :tmp_dir
+  test "unselected audit entries require integrity but not executable patch reconstruction", %{
+    tmp_dir: tmp_dir
+  } do
+    path = Path.join(tmp_dir, "unselected-plan.json")
+    original = "defmodule Example do\n  def value, do: :original\nend\n"
+    plan = nested_plan(original, "not executable")
+    [mutant] = plan["mutants"]
+
+    mutant = %{
+      mutant
+      | "selected" => false,
+        "selection_reason" => "excluded_by_optimizer",
+        "mutated_source" => "not executable",
+        "mutated_sha256" => sha256("not executable")
+    }
+
+    write_json!(path, %{
+      plan
+      | "exhaustive" => false,
+        "selected_count" => 0,
+        "mutants" => [mutant]
+    })
+
+    assert {:ok, %{selected_ids: []}} = Validator.validate_plan_file(path)
+
+    write_json!(path, %{
+      plan
+      | "exhaustive" => false,
+        "selected_count" => 0,
+        "mutants" => [
+          %{mutant | "selection_reason" => "selected_by_optimizer"}
+        ]
+    })
+
+    assert {:error, :plan_invalid_mutant_entry} = Validator.validate_plan_file(path)
+  end
+
+  @tag :tmp_dir
   test "rejects patches against sources that cannot be parsed", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "unparsable-plan.json")
     original = "defmodule Example do\n  def value, do: :original\n"

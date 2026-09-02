@@ -3,20 +3,24 @@ defmodule Muex.CampaignTaskTest do
 
   alias Mix.Tasks.Muex.Campaign
   alias Muex.CampaignPlan
+  alias Muex.Coverage
 
   @tag :tmp_dir
   test "builds one immutable plan and materializes an exact shard slice", %{tmp_dir: root} do
     write!(root, "lib/a.ex", "a")
     write!(root, "lib/b.ex", "b")
     write!(root, "test/a_test.exs", "a test")
+    write!(root, "bin/runtime-value", "available")
     source_list = Path.join(root, "sources.txt")
     test_list = Path.join(root, "tests.txt")
+    auxiliary_list = Path.join(root, "auxiliary.txt")
     audit_plan = Path.join(root, "audit-plan.json")
     config_file = Path.join(root, "config.json")
     plan_path = Path.join(root, "campaign.json")
     slice_path = Path.join(root, "slice.json")
     File.write!(source_list, "lib/a.ex\nlib/b.ex\n")
     File.write!(test_list, "test/a_test.exs\n")
+    File.write!(auxiliary_list, "bin\n")
 
     config = %{
       preset: "none",
@@ -32,6 +36,27 @@ defmodule Muex.CampaignTaskTest do
       Jason.encode!(audit_plan(%{"lib/a.ex" => "a", "lib/b.ex" => "b"}, config))
     )
 
+    coverage_fingerprint =
+      Coverage.corpus_fingerprint(
+        root,
+        ["lib/a.ex", "lib/b.ex"],
+        ["test/a_test.exs"],
+        nil,
+        ["bin"]
+      )
+
+    coverage_index = Path.join(root, "coverage.etf")
+    Coverage.write_index!(Coverage.new(), coverage_index)
+
+    File.write!(
+      coverage_index <> ".manifest.json",
+      Jason.encode!(%{
+        version: 1,
+        corpus_fingerprint: coverage_fingerprint,
+        index_sha256: sha256_file(coverage_index)
+      })
+    )
+
     Mix.Task.reenable("muex.campaign")
 
     assert :ok =
@@ -45,6 +70,10 @@ defmodule Muex.CampaignTaskTest do
                source_list,
                "--test-files",
                test_list,
+               "--auxiliary-paths-file",
+               auxiliary_list,
+               "--coverage-index",
+               coverage_index,
                "--config-file",
                config_file,
                "--shards",
@@ -59,6 +88,8 @@ defmodule Muex.CampaignTaskTest do
     assert plan["metadata"]["commit_sha"] == "metadata-only"
     assert plan["metadata"]["audit_plan_sha256"] == sha256_file(audit_plan)
     assert plan["metadata"]["audit_optimizer"]["enabled"] == true
+    assert plan["coverage"]["corpus_fingerprint"] == coverage_fingerprint
+    assert plan["coverage"]["index_sha256"] == sha256_file(coverage_index)
     assert length(plan["requirements"]) == 2
     plan_artifact_sha256 = sha256_file(plan_path)
 
@@ -75,6 +106,8 @@ defmodule Muex.CampaignTaskTest do
                plan_artifact_sha256,
                "--config-file",
                config_file,
+               "--coverage-index",
+               coverage_index,
                "--shard",
                "1",
                "--output",
@@ -83,7 +116,7 @@ defmodule Muex.CampaignTaskTest do
 
     slice_artifact_sha256 = sha256_file(slice_path)
     assert {:ok, slice} = CampaignPlan.read_execution_slice(slice_path, slice_artifact_sha256)
-    assert slice["coverage"]["status"] == "unavailable"
+    assert slice["coverage"]["status"] == "valid"
     assert slice["plan_artifact_sha256"] == plan_artifact_sha256
     assert is_binary(slice["slice_sha256"])
     assert length(slice["source_files"]) == 1

@@ -1,6 +1,67 @@
 defmodule Mix.Tasks.Muex.Coverage do
-  @shortdoc false
-  @moduledoc false
+  @shortdoc "Builds, merges, and validates a campaign coverage index"
+
+  @moduledoc """
+  Builds the coverage index a campaign binds itself to.
+
+  This is the coverage half of the seam documented in `docs/CAMPAIGN_API.md`;
+  read that file for how the artifacts below feed `mix muex.campaign build`,
+  `mix muex.campaign slice`, and a shard run.
+
+  ## Subcommands
+
+  `manifest` writes the selective module manifest for the campaign's sources,
+  resolved against the current `Mix.Project.compile_path/0`:
+
+      mix muex.coverage manifest --project-root . \\
+        --source-files sources.txt --output selective.json
+
+  `export` runs the given tests under `Muex.Coverage.SelectiveTool` and writes
+  a coverage index plus its adjacent `<index>.manifest.json`:
+
+      mix muex.coverage export --project-root . \\
+        --source-files sources.txt --test-files part-1.txt \\
+        --corpus-test-files tests.txt --auxiliary-paths-file auxiliary.txt \\
+        --partition 1 \\
+        --index part-1.etf --audit-dir audit/part-1
+
+  `merge` joins partition indexes into one index and manifest, and `validate`
+  re-checks an index against its manifest:
+
+      mix muex.coverage merge --parts-file parts.txt \\
+        --expected-tests-file tests.txt --index coverage.etf \\
+        --manifest coverage.manifest.json
+
+      mix muex.coverage validate --expected-tests-file tests.txt \\
+        --index coverage.etf --manifest coverage.manifest.json
+
+  `--parts-file` lists *index* paths; each must still have its adjacent
+  `<index>.manifest.json`, and `merge` mirrors its output manifest to the
+  index's adjacent path when `--manifest` names a different file.
+
+  ## Inputs
+
+  Every path option is read as given; newline-delimited list files ignore blank
+  lines. `--auxiliary-paths-file` lists explicit project-relative existing
+  roots/files needed by tests inside the coverage sandbox. The same list must
+  be passed to `mix muex.campaign build`. `MUEX_COVERAGE_MODULES_FILE` selects
+  the manifest written by
+  `manifest`: `export` instruments exactly its modules and folds the file into
+  the index's `corpus_fingerprint`. Leaving it unset makes `export` load the
+  sources itself and fingerprint without a selective manifest, so it must be
+  set identically for `export` and for the `--selective-manifest` of
+  `mix muex.campaign build`.
+
+  ## Failures
+
+  Every failure raises `Mix.Error`: unknown subcommands, missing or invalid
+  options, a partition whose manifest no longer matches its index
+  (`invalid coverage partition`), partitions that are not disjoint and
+  exhaustive over the expected corpus, and an index that drifted from its
+  manifest (`coverage index validation failed`). A fingerprint mismatch is not
+  raised here — it surfaces later as a degraded campaign slice, see
+  `docs/CAMPAIGN_API.md`.
+  """
 
   use Mix.Task
 
@@ -19,7 +80,8 @@ defmodule Mix.Tasks.Muex.Coverage do
     manifest: :string,
     audit_dir: :string,
     partition: :integer,
-    output: :string
+    output: :string,
+    auxiliary_paths_file: :string
   ]
 
   @impl Mix.Task
@@ -43,6 +105,7 @@ defmodule Mix.Tasks.Muex.Coverage do
     source_files = read_lines(Keyword.fetch!(opts, :source_files))
     relative_tests = read_lines(Keyword.fetch!(opts, :test_files))
     corpus_tests = read_lines(Keyword.fetch!(opts, :corpus_test_files))
+    auxiliary_paths = read_optional_lines(opts[:auxiliary_paths_file])
     test_files = Enum.map(relative_tests, &Path.expand(&1, root))
     corpus_test_files = Enum.map(corpus_tests, &Path.expand(&1, root))
 
@@ -50,23 +113,25 @@ defmodule Mix.Tasks.Muex.Coverage do
 
     audit_dir = Keyword.fetch!(opts, :audit_dir)
 
-    index =
-      Coverage.collect(test_files, file_to_module,
+    collection =
+      Coverage.collect_with_auxiliary_snapshot(test_files, file_to_module,
         cd: root,
         test_paths: [Path.join(root, "test")],
+        auxiliary_paths: auxiliary_paths,
         output: audit_dir
       )
 
     index_path = Keyword.fetch!(opts, :index)
-    Coverage.write_index!(index, index_path)
+    Coverage.write_index!(collection.index, index_path)
     batch_evidence = evidence(audit_dir)
 
     corpus_fingerprint =
-      Coverage.corpus_fingerprint(
+      Coverage.corpus_fingerprint_from_auxiliary_snapshot(
         root,
         source_files,
         corpus_test_files,
-        System.get_env("MUEX_COVERAGE_MODULES_FILE")
+        System.get_env("MUEX_COVERAGE_MODULES_FILE"),
+        collection.auxiliary_snapshot
       )
 
     write_json!(index_path <> ".manifest.json", %{
@@ -255,6 +320,9 @@ defmodule Mix.Tasks.Muex.Coverage do
     |> Enum.map(&String.trim_trailing/1)
     |> Enum.reject(&(&1 == ""))
   end
+
+  defp read_optional_lines(nil), do: []
+  defp read_optional_lines(path), do: read_lines(path)
 
   defp evidence(dir) do
     dir

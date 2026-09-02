@@ -8,6 +8,7 @@ defmodule Muex.Config.Internal do
           checkpoint: Path.t() | nil,
           coverage_index_file: Path.t() | nil,
           coverage_corpus_fingerprint: String.t() | nil,
+          auxiliary_paths: [Path.t()],
           inventory_cache_file: Path.t() | nil,
           inventory_cache_key: String.t() | nil
         }
@@ -20,6 +21,7 @@ defmodule Muex.Config.Internal do
     :coverage_corpus_fingerprint,
     :inventory_cache_file,
     :inventory_cache_key,
+    auxiliary_paths: [],
     audit_only: false
   ]
 end

@@ -4,6 +4,20 @@ defmodule Muex.Coverage.SelectiveTool do
 
   The module manifest is generated from an already compiled application build.
   Ordinary `mix test --cover` runs do not select this tool.
+
+  A campaign selects it from the project under test:
+
+      test_coverage: [tool: Muex.Coverage.SelectiveTool]
+
+  and points `MUEX_COVERAGE_MODULES_FILE` at a manifest written by
+  `write_manifest!/4` (or by `mix muex.coverage manifest`). The tool raises
+  `Mix.Error` when that variable is unset, when the manifest is malformed or
+  carries an unsupported version, and when a listed beam is missing, duplicated,
+  or resolves outside the compile path. It never traverses beams the manifest
+  did not list.
+
+  `mix muex.coverage` drives this tool for a campaign; see
+  `docs/CAMPAIGN_API.md`.
   """
 
   alias Mix.Tasks.Test.Coverage, as: MixCoverage
@@ -76,7 +90,16 @@ defmodule Muex.Coverage.SelectiveTool do
     })
   end
 
-  @doc false
+  @doc """
+  Reads a manifest written by `write_manifest!/4`, resolved against `compile_path`.
+
+  Returns one entry per selected module as `%{source: relative path, module: atom,
+  beam: path}`. Raises `Mix.Error` on a malformed or unsupported manifest, on a
+  duplicate module, and on a beam that is missing or outside `compile_path`.
+  """
+  @spec read_manifest!(Path.t(), Path.t()) :: [
+          %{source: String.t(), module: module(), beam: Path.t()}
+        ]
   def read_manifest!(manifest_path, compile_path) do
     manifest_path = canonical_regular_file!(manifest_path, "selective coverage manifest")
     compile_path = canonical_existing!(compile_path, "compile path")

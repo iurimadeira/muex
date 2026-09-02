@@ -15,6 +15,7 @@ four public Mix tasks:
 | `mix muex` (shard form) | Execute one shard's mutations against a checkpoint |
 | `mix muex.validate` | Turn a shard's checkpoint plus report into a validation artifact |
 | `mix muex.continuation prepare` / `finalize` | Split and re-join an interrupted campaign |
+| `mix muex.coverage` | Build, merge, and validate the coverage index a campaign binds to |
 
 Muex owns every artifact it writes. The wrapper owns the campaign manifest, the
 source snapshot, and the per-shard file lists described under
@@ -67,6 +68,10 @@ Build refuses the inventory unless all of these hold:
 The result is content-addressed. Sharding is source-file-atomic — a file's
 mutations never straddle two shards — and greedy min-work packed.
 
+Pass `--coverage-index` (and the matching `--selective-manifest`) to bind the
+plan to a coverage index; see
+[Coverage-guided campaigns](#coverage-guided-campaigns).
+
 ## 3. Slice
 
 ```sh
@@ -77,7 +82,9 @@ mix muex.campaign slice --project-root . \
 
 `--plan-sha256` is mandatory: the slice is refused when the plan artifact drifts
 by a single byte. The slice carries `source_files`, `test_files`, `mutant_ids`,
-`requirements`, the coverage binding, and its own `slice_sha256`.
+`requirements`, the coverage binding, and its own `slice_sha256`. Pass
+`--coverage-index <path>` to resolve that binding; see
+[Coverage-guided campaigns](#coverage-guided-campaigns).
 
 ## 4. Shard execution
 
@@ -102,8 +109,14 @@ mix muex --project-root . \
   --campaign-fingerprint "$GLOBAL_FINGERPRINT" \
   --inventory-cache-file inventory-cache/shard-1.etf \
   --inventory-cache-key "$INVENTORY_KEY" \
+  --auxiliary-paths-file auxiliary.txt \
   --format json --report-file invocation.a1/shard-1.json
 ```
+
+`--auxiliary-paths-file` uses the same validated project-relative snapshot
+contract as coverage export. Muex copies each listed file or directory read-only
+into every shard sandbox, including the baseline run, and binds its bytes into
+the checkpoint fingerprint.
 
 The checkpoint is append-only JSONL and is the resume point: re-running the shard
 skips every mutation already recorded there. Give each attempt its own
@@ -165,6 +178,164 @@ re-validates each child shard from that shard's plan, checkpoint and report — 
 same evidence `mix muex.validate` consumes — and records the path of
 `shard-N.validation.json` without reading it; `prepare` likewise never reads the
 parent's report.
+
+## Coverage-guided campaigns
+
+A campaign may bind itself to a prebuilt line-level coverage index so each
+mutant runs only the tests that execute its line. The index is built by
+`mix muex.coverage`, bound into the plan at build time, resolved per shard at
+slice time, and consumed by the shard run.
+
+The project under test selects Muex's coverage tool in its `mix.exs`:
+
+```elixir
+test_coverage: [tool: Muex.Coverage.SelectiveTool]
+```
+
+`Muex.Coverage.SelectiveTool` instruments only the modules named by
+`MUEX_COVERAGE_MODULES_FILE`, from an already compiled build. Ordinary
+`mix test --cover` runs never select it.
+
+### 1. Selective manifest
+
+```sh
+mix muex.coverage manifest --project-root . \
+  --source-files sources.txt --output selective.json
+```
+
+`sources.txt` is the same newline-delimited list the campaign is built from.
+The manifest maps each selected source to its module and beam inside the
+current `Mix.Project.compile_path/0`, so the build must already be compiled.
+It is optional but recommended: without it, coverage export instruments every
+source it can load, and the corpus fingerprint is computed without a manifest.
+
+### 2. Export
+
+Split `tests.txt` into disjoint partitions and export each one — on one machine
+or many. Each partition writes an index and an adjacent
+`<index>.manifest.json`:
+
+```sh
+export MUEX_COVERAGE_MODULES_FILE=selective.json
+mix muex.coverage export --project-root . \
+  --source-files sources.txt \
+  --test-files part-1.txt --corpus-test-files tests.txt \
+  --auxiliary-paths-file auxiliary.txt \
+  --partition 1 --index coverage/part-1.etf --audit-dir audit/part-1
+```
+
+`--test-files` is this partition's tests; `--corpus-test-files` is always the
+whole campaign corpus, so every partition agrees on the same
+`corpus_fingerprint`. `--audit-dir` receives the raw `.coverdata` exports, and
+their paths, sizes, and digests are recorded as the partition's `evidence`.
+`--auxiliary-paths-file` is optional. Each nonblank line names an explicit
+project-relative existing file or directory that tests need inside the private
+coverage sandbox. Traversal, absolute paths, missing paths, symlinks, and
+special files are rejected. Muex copies and makes these snapshots read-only;
+tests never execute through live links to the project. The listed names and
+exact snapshot contents participate in the corpus fingerprint.
+
+### 3. Merge and validate
+
+```sh
+printf '%s\n' coverage/part-1.etf coverage/part-2.etf > parts.txt
+mix muex.coverage merge --parts-file parts.txt \
+  --expected-tests-file tests.txt \
+  --index coverage.etf --manifest coverage.manifest.json
+
+mix muex.coverage validate --expected-tests-file tests.txt \
+  --index coverage.etf --manifest coverage.manifest.json
+```
+
+`parts.txt` lists *index* paths, each of which must still have its adjacent
+`<index>.manifest.json`. Merge refuses to proceed unless every partition
+manifest still matches its index byte for byte (`invalid coverage partition`),
+and unless the partitions are disjoint, exhaustive over `tests.txt`, and share
+one `corpus_fingerprint` and one corpus digest (`coverage partitions are not
+disjoint and exhaustive`). Because evidence is re-`lstat`ed and re-hashed, run
+`merge` from the same working directory as the exports, with their
+`--audit-dir` contents still in place.
+
+`merge` writes its manifest to `--manifest` and mirrors it to
+`coverage.etf.manifest.json` when the two differ. That adjacent file is what
+binds the index later, so keep the pair together.
+
+### 4. Binding the index to a campaign
+
+```sh
+mix muex.campaign build --project-root . \
+  --audit-plan inventory.json \
+  --source-files sources.txt --test-files tests.txt \
+  --auxiliary-paths-file auxiliary.txt \
+  --config-file config.json \
+  --coverage-index coverage.etf --selective-manifest selective.json \
+  --shards 4 --commit-sha "$SHA" --output campaign.json
+```
+
+Build recomputes the corpus fingerprint from `--project-root`,
+`--source-files`, `--test-files`, `--auxiliary-paths-file`, and
+`--selective-manifest`, then reads the
+index only if `coverage.etf.manifest.json` declares `version` 1, that exact
+`corpus_fingerprint`, and an `index_sha256` equal to the index's own digest.
+The plan records the binding as
+
+```json
+{"coverage": {"corpus_fingerprint": "<64 hex>", "index_sha256": "<64 hex>"}}
+```
+
+and `index_sha256` is `null` when no usable index was bound. Coverage is a
+planning input, never a gate: an index that fails any of those checks is
+dropped and the plan is still built, with per-mutant requirements falling back
+to the full test corpus.
+
+`--selective-manifest` must name the same file `MUEX_COVERAGE_MODULES_FILE`
+named during export. Setting it in one place and not the other changes the
+fingerprint and silently costs the campaign its coverage.
+Likewise, coverage export and campaign build must receive the same auxiliary
+path list; changing any listed path or its contents makes the index stale.
+
+### 5. Resolving the binding per shard
+
+`mix muex.campaign slice --coverage-index coverage.etf` re-checks the index
+against the plan's binding and reports the result in `slice["coverage"]["status"]`:
+
+| Status | Meaning |
+| --- | --- |
+| `valid` | the artifact matches the plan's `corpus_fingerprint` and `index_sha256`; `test_files` stay coverage-scoped |
+| `unavailable` | the plan was built without a usable index; the shard runs its declared corpus |
+| `stale` | the plan is bound to an index this artifact does not satisfy |
+
+A `stale` artifact expands **only that shard** to the full declared corpus and
+marks it: `slice["fallback_reasons"] == ["coverage_artifact_stale"]`, and every
+requirement gets `"fallback_reason" => "coverage_artifact_stale"` with
+`estimated_work` recomputed. Degradation is deliberate — a drifted index must
+never silence a mutant. It is also lossy: a missing file, unreadable manifest,
+wrong version, fingerprint mismatch, digest mismatch, and undecodable index all
+collapse into the same `stale`, so an orchestrator that needs to tell them apart
+must re-run `mix muex.coverage validate` against the artifact.
+
+### 6. Consuming the index in a shard run
+
+```sh
+mix muex --project-root . \
+  ... \
+  --coverage-guided \
+  --coverage-index-file coverage.etf \
+  --coverage-corpus-fingerprint "$(jq -r .coverage.corpus_fingerprint campaign.json)" \
+  --auxiliary-paths-file auxiliary.txt
+```
+
+`--coverage-index-file` requires `--coverage-guided`, and
+`--coverage-corpus-fingerprint` requires `--coverage-index-file`; the
+fingerprint must be a lowercase SHA-256 digest. Passing the plan's fingerprint
+explicitly is the safe form: without it the run recomputes the fingerprint from
+its own `--files`, `--test-paths` and `MUEX_COVERAGE_MODULES_FILE`, which a
+shard-scoped file list will not reproduce. A rejected index is not an error —
+the run measures coverage in-process instead, so the shard stays correct and
+only loses the campaign's precomputed work.
+
+Omitting `--coverage-index-file` entirely leaves `--coverage-guided` measuring
+coverage in-process for that shard.
 
 ## Wrapper-owned artifacts
 

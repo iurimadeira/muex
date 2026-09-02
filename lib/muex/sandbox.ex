@@ -26,6 +26,7 @@ defmodule Muex.Sandbox do
 
   @type sandbox :: %{
           optional(:owner_token) => String.t(),
+          optional(:auxiliary_paths) => [Path.t()],
           root: Path.t(),
           project_root: Path.t(),
           build_env: String.t()
@@ -38,9 +39,12 @@ defmodule Muex.Sandbox do
   """
   @spec create_pool(non_neg_integer(), keyword()) :: [sandbox()]
   def create_pool(count, opts \\ []) do
-    project_root = Keyword.get(opts, :project_root, File.cwd!())
+    project_root = opts |> Keyword.get(:project_root, File.cwd!()) |> Path.expand()
     build_env = Keyword.get(opts, :build_env, "test")
     test_paths = Keyword.get(opts, :test_paths, ["test"])
+
+    auxiliary_paths =
+      validate_auxiliary_paths!(project_root, Keyword.get(opts, :auxiliary_paths, []))
 
     unique = System.unique_integer([:positive, :monotonic])
 
@@ -55,9 +59,26 @@ defmodule Muex.Sandbox do
       root = Path.join(base_dir, "worker_#{i}")
 
       root
-      |> create_sandbox(project_root, build_env, test_paths)
+      |> do_create_sandbox(project_root, build_env, test_paths, auxiliary_paths)
       |> Map.put(:owner_token, owner_token)
     end
+  end
+
+  @doc false
+  def validate_auxiliary_paths!(project_root, paths) when is_list(paths) do
+    project_root = Path.expand(project_root)
+
+    paths
+    |> Enum.map(&validate_auxiliary_path!(project_root, &1))
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.reduce([], fn path, roots ->
+      if Enum.any?(roots, &path_within?(path, &1)), do: roots, else: roots ++ [path]
+    end)
+  end
+
+  def validate_auxiliary_paths!(_project_root, paths) do
+    raise ArgumentError, "unsafe auxiliary project paths: #{inspect(paths)}"
   end
 
   @doc """
@@ -65,6 +86,10 @@ defmodule Muex.Sandbox do
   """
   @spec create_sandbox(Path.t(), Path.t(), String.t(), [String.t()]) :: sandbox()
   def create_sandbox(root, project_root, build_env, test_paths) do
+    do_create_sandbox(root, Path.expand(project_root), build_env, test_paths, [])
+  end
+
+  defp do_create_sandbox(root, project_root, build_env, test_paths, auxiliary_paths) do
     File.mkdir_p!(root)
 
     # Symlink top-level files
@@ -93,6 +118,8 @@ defmodule Muex.Sandbox do
       ]
     )
 
+    Enum.each(auxiliary_paths, &copy_auxiliary_path!(root, project_root, &1))
+
     # Symlink deps/ (shared, read-only)
     safe_symlink(Path.join(project_root, "deps"), Path.join(root, "deps"))
 
@@ -101,7 +128,12 @@ defmodule Muex.Sandbox do
     # artifacts on demand.
     setup_build_dir(root, project_root, build_env)
 
-    %{root: root, project_root: project_root, build_env: build_env}
+    %{
+      root: root,
+      project_root: project_root,
+      build_env: build_env,
+      auxiliary_paths: auxiliary_paths
+    }
   end
 
   @doc "Makes every mutated application's build artifacts private to this sandbox."
@@ -177,6 +209,7 @@ defmodule Muex.Sandbox do
 
         if File.exists?(base_dir) do
           Enum.each(sandboxes, &validate_private_root!/1)
+          Enum.each(sandboxes, &unseal_auxiliary_paths/1)
           File.rm_rf!(base_dir)
         end
 
@@ -189,12 +222,21 @@ defmodule Muex.Sandbox do
 
   @doc false
   def rebuild(sandbox, file_paths, test_paths) do
-    with :ok <- validate_private_root(sandbox) do
+    with :ok <- validate_private_root(sandbox),
+         auxiliary_paths <-
+           validate_auxiliary_paths!(sandbox.project_root, Map.get(sandbox, :auxiliary_paths, [])),
+         :ok <- unseal_auxiliary_paths(sandbox),
+         :ok <- validate_private_root(sandbox) do
       File.rm_rf!(sandbox.root)
 
       rebuilt =
         sandbox.root
-        |> create_sandbox(sandbox.project_root, sandbox.build_env, test_paths)
+        |> do_create_sandbox(
+          sandbox.project_root,
+          sandbox.build_env,
+          test_paths,
+          auxiliary_paths
+        )
         |> Map.put(:owner_token, sandbox.owner_token)
 
       with :ok <- prepare(rebuilt, file_paths), do: {:ok, rebuilt}
@@ -265,9 +307,110 @@ defmodule Muex.Sandbox do
   end
 
   defp canonical_existing_result(path) do
-    case System.cmd("realpath", ["-e", path], stderr_to_stdout: true) do
+    case System.cmd("realpath", ["-e", "--", path], stderr_to_stdout: true) do
       {canonical, 0} -> {:ok, String.trim(canonical)}
       {_message, _status} -> {:error, :not_canonical}
+    end
+  end
+
+  defp validate_auxiliary_path!(project_root, path) when is_binary(path) do
+    parts = Path.split(path)
+    candidate = Path.expand(path, project_root)
+
+    valid? =
+      Path.type(path) == :relative and parts != [] and
+        Enum.all?(parts, &(&1 not in [".", ".."])) and Path.join(parts) == path and
+        String.starts_with?(candidate, project_root <> "/") and
+        canonical_existing_result(project_root) == {:ok, project_root} and
+        canonical_existing_result(candidate) == {:ok, candidate} and
+        safe_auxiliary_tree?(candidate)
+
+    if valid?, do: Path.relative_to(candidate, project_root), else: unsafe_auxiliary_path!(path)
+  end
+
+  defp validate_auxiliary_path!(_project_root, path), do: unsafe_auxiliary_path!(path)
+
+  defp safe_auxiliary_tree?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        true
+
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, entries} -> Enum.all?(entries, &safe_auxiliary_tree?(Path.join(path, &1)))
+          {:error, _reason} -> false
+        end
+
+      _other ->
+        false
+    end
+  end
+
+  defp unsafe_auxiliary_path!(path) do
+    raise ArgumentError, "unsafe auxiliary project path: #{inspect(path)}"
+  end
+
+  defp copy_auxiliary_path!(root, project_root, relative) do
+    source = Path.join(project_root, relative)
+    target = Path.join(root, relative)
+    File.mkdir_p!(Path.dirname(target))
+
+    case File.lstat(target) do
+      {:error, :enoent} -> :ok
+      _existing -> unsafe_auxiliary_path!(relative)
+    end
+
+    copy_flags =
+      case File.lstat!(source) do
+        %File.Stat{type: :directory} -> ["-RP"]
+        %File.Stat{type: :regular} -> ["-P"]
+      end
+
+    separator = if match?({:unix, :darwin}, :os.type()), do: [], else: ["--"]
+
+    case System.cmd("cp", copy_flags ++ separator ++ [source, target], stderr_to_stdout: true) do
+      {_output, 0} ->
+        validate_auxiliary_paths!(root, [relative])
+        seal_auxiliary_tree!(target)
+
+      {_output, _status} ->
+        unsafe_auxiliary_path!(relative)
+    end
+  end
+
+  defp path_within?(path, root) do
+    path_parts = Path.split(path)
+    root_parts = Path.split(root)
+    Enum.take(path_parts, length(root_parts)) == root_parts
+  end
+
+  defp seal_auxiliary_tree!(path) do
+    stat = File.lstat!(path)
+
+    if stat.type == :directory do
+      path |> File.ls!() |> Enum.each(&seal_auxiliary_tree!(Path.join(path, &1)))
+    end
+
+    File.chmod!(path, Bitwise.band(stat.mode, 0o555))
+  end
+
+  defp unseal_auxiliary_paths(%{root: root, auxiliary_paths: paths}) do
+    Enum.each(paths, &make_auxiliary_tree_removable(Path.join(root, &1)))
+  end
+
+  defp unseal_auxiliary_paths(_sandbox), do: :ok
+
+  defp make_auxiliary_tree_removable(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        File.chmod!(path, 0o700)
+        path |> File.ls!() |> Enum.each(&make_auxiliary_tree_removable(Path.join(path, &1)))
+
+      {:ok, %File.Stat{type: :regular}} ->
+        File.chmod!(path, 0o600)
+
+      _missing_or_unsafe ->
+        :ok
     end
   end
 
